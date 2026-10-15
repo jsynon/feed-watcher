@@ -1,0 +1,11 @@
+{
+  "publishing_enabled": false,
+  "facebook_channel_id": "",
+  "x_channel_id": "",
+  "poll_interval_minutes": 60,
+  "minimum_hours_between_articles": 2,
+  "max_articles_per_day": 5,
+  "max_auto_retries": 3,
+  "retry_wait_minutes": 60,
+  "max_age_days_for_new_items": 30
+}
