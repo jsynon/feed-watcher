@@ -544,13 +544,31 @@ def main() -> int:
     class Tee:
         # pythonw.exe has no console streams. Keep the file logger working
         # while safely omitting sys.__stdout__/sys.__stderr__ when absent.
-        def __init__(self, *streams): self.streams = tuple(s for s in streams if s is not None)
+        def __init__(self, console_stream, log_stream):
+            self.console_stream = console_stream
+            self.log_stream = log_stream
+            self.pending = ""
+
         def write(self, value):
-            for stream in self.streams:
-                stream.write(value)
-                stream.flush()
+            if self.console_stream is not None:
+                self.console_stream.write(value)
+                self.console_stream.flush()
+            self.pending += value
+            while "\n" in self.pending:
+                line, self.pending = self.pending.split("\n", 1)
+                stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                self.log_stream.write(f"[{stamp}] {line}\n")
+                self.log_stream.flush()
+
         def flush(self):
-            for stream in self.streams: stream.flush()
+            if self.pending:
+                stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                self.log_stream.write(f"[{stamp}] {self.pending}\n")
+                self.pending = ""
+            if self.console_stream is not None:
+                self.console_stream.flush()
+            self.log_stream.flush()
+
     log_handle = LOG_PATH.open("a", encoding="utf-8")
     sys.stdout = Tee(sys.__stdout__, log_handle)
     sys.stderr = Tee(sys.__stderr__, log_handle)
