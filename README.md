@@ -12,15 +12,15 @@ The watcher does not publish articles on the website, copy their full text, or l
 
 1. **Read the source list.** `feeds.opml` contains the `Feeds` folder from the Feedly export, currently 84 philosophy sources. The watcher fetches the feed URLs directly and parses them with Python’s `feedparser` dependency.
 2. **Establish a baseline.** The one-time baseline marks articles already present as seen, so setup does not publish a backlog. It creates `state.json` and never sends posts.
-3. **Find new articles.** Each feed is checked hourly by default. New items must have a publication date later than the baseline and be within the 30-day age limit. Undated and stale items are marked seen but not queued. Canonicalized article links help prevent duplicates from tracking parameters.
-4. **Queue and publish at a measured pace.** The queue is ordered with older eligible articles first. The watcher sends at most one article per run and tracks Facebook and X separately; an article leaves the queue only after both channels accept it.
-5. **Keep a local record.** `state.json` stores the baseline, seen links, queue, and destination statuses. `watcher.log` records feed errors and publishing results so the task can resume and be checked later.
+3. **Find new articles.** Each feed is checked hourly by default. New items must have a publication date later than the baseline and on the current local calendar day. Undated, older, or prior-day items are marked seen but not queued. Canonicalized article links help prevent duplicates from tracking parameters.
+4. **Queue and publish at a measured pace.** The queue is ordered with older eligible articles first. The watcher sends at most one article per run and tracks Facebook and X separately; an article leaves the queue only after both channels accept it. Any unfinished item is discarded after its publication date ends, so articles never spill into the next day.
+5. **Keep a local record.** `state.json` stores the baseline, seen links, queue, and destination statuses. `watcher.log` records feed errors and publishing results with local timestamps and timezone offsets, so the task can resume and be checked later.
 
 Posts contain the title, an optional `By: Author` line when a feed supplies an author, and the feed name as the source. X also gets the article URL. Facebook gets a regular post with a link attachment built from the article page’s Open Graph metadata when available, allowing Buffer to show its title, description, and image.
 
 ## Pacing and delivery behavior
 
-Windows Task Scheduler runs the watcher every 15 minutes to see whether a feed poll or queued post is due. By default, each feed is fetched once an hour, there is a two-hour minimum between accepted articles, and no more than five articles are released per day.
+Windows Task Scheduler runs the watcher every 15 minutes to see whether a feed poll or queued post is due. By default, each feed is fetched once an hour, there is a one-hour minimum between accepted articles, and no more than ten articles are released per day. Since only same-day articles are eligible, items left at midnight are discarded. If more than ten eligible articles arrive in one day, or the pacing gap prevents them from clearing before midnight, the remainder will be skipped rather than posted late.
 
 Rejected posts remain queued for retry after the configured wait. Authentication, permission, or invalid-post errors need attention. If the watcher loses the response after submitting to Buffer, it marks that destination’s result uncertain and does not retry automatically, since Buffer may already have accepted the post. This reduces the chance of duplicates while leaving the item available for manual review.
 
@@ -54,11 +54,10 @@ Edit the local `config.json`, which is created from `config.example.json`. Defau
 | `publishing_enabled` | `false` | Must be deliberately enabled before any post can be sent. |
 | `facebook_channel_id`, `x_channel_id` | empty | Buffer destinations for the Facebook Page and X account. |
 | `poll_interval_minutes` | `60` | Minimum interval between checks of each feed. |
-| `minimum_hours_between_articles` | `2` | Minimum time between accepted articles. |
-| `max_articles_per_day` | `5` | Daily publishing cap. |
+| `minimum_hours_between_articles` | `1` | Minimum time between accepted articles. |
+| `max_articles_per_day` | `10` | Daily publishing cap. |
 | `max_auto_retries` | `3` | Maximum attempts for a rejected destination before manual review. |
 | `retry_wait_minutes` | `60` | Wait before retrying a rejected post. |
-| `max_age_days_for_new_items` | `30` | Excludes old articles discovered after a feed repair. |
 
 ## Checking and controlling the watcher
 

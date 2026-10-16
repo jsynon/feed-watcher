@@ -56,6 +56,12 @@ def parse_datetime(value: str | None) -> dt.datetime | None:
         return None
 
 
+def local_publication_date(value: str | None) -> dt.date | None:
+    """Return an article's publication date in the computer's local timezone."""
+    parsed = parse_datetime(value)
+    return parsed.astimezone().date() if parsed else None
+
+
 def canonical_url(url: str) -> str:
     parts = urllib.parse.urlsplit(url.strip())
     if parts.scheme not in {"http", "https"} or not parts.netloc:
@@ -99,11 +105,10 @@ def load_config() -> dict:
         "facebook_channel_id": "",
         "x_channel_id": "",
         "poll_interval_minutes": 60,
-        "minimum_hours_between_articles": 2,
-        "max_articles_per_day": 5,
+        "minimum_hours_between_articles": 1,
+        "max_articles_per_day": 10,
         "max_auto_retries": 3,
-        "retry_wait_minutes": 60,
-        "max_age_days_for_new_items": 30
+        "retry_wait_minutes": 60
     }
     current = load_json(CONFIG_PATH, {})
     defaults.update(current)
@@ -248,7 +253,7 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
         return 0
     results = fetch_many(due)
     new_count = 0
-    cutoff = now - dt.timedelta(days=max(1, int(config.get("max_age_days_for_new_items", 30))))
+    today = now.astimezone().date()
     for feed, items, error in results:
         url = feed["url"]
         state["last_checked"][url] = iso(now)
@@ -261,9 +266,10 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
             if key in state.setdefault("seen", {}):
                 continue
             published = parse_datetime(item.get("published_at"))
-            # Dated items must be newer than setup and not excessively stale.
-            # Undated items are skipped to avoid accidentally importing old history.
-            if not published or published <= baseline or published < cutoff:
+            # Only publish an article on its local calendar publication date.
+            # Undated, pre-baseline, and prior-day items are marked seen and skipped.
+            if (not published or published <= baseline or
+                    published.astimezone().date() != today):
                 state["seen"][key] = {"url": item["url"], "seen_at": iso(now), "skipped": True}
                 continue
             state["seen"][key] = {"url": item["url"], "seen_at": iso(now)}
@@ -422,6 +428,13 @@ def facebook_link_attachment(item: dict) -> dict:
 
 def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     queue = state.get("queue", [])
+    today = dt.datetime.now().astimezone().date()
+    original_count = len(queue)
+    queue[:] = [entry for entry in queue
+                if local_publication_date(entry.get("published_at")) == today]
+    expired_count = original_count - len(queue)
+    if expired_count:
+        print(f"Discarded {expired_count} queued article(s) not published today.")
     item = next((entry for entry in queue if any(v in {"pending", "retry"} for v in entry["targets"].values())), None)
     if item is None:
         print("Queue is empty; nothing to preview." if dry_run else "Queue is empty; nothing to publish.")
@@ -439,15 +452,18 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     day = now.date().isoformat()
     sent_today = state.setdefault("sent_today", {})
     sent_today[day] = int(sent_today.get(day, 0))
-    if sent_today[day] >= int(config.get("max_articles_per_day", 5)):
-        print(f"Daily cap reached ({sent_today[day]} articles). The queue will wait until tomorrow.")
-        return False
-    last_post = parse_datetime(state.get("last_article_posted_at"))
-    gap = max(0, float(config.get("minimum_hours_between_articles", 2)))
-    if last_post and (utcnow() - last_post).total_seconds() < gap * 3600:
-        print("Waiting for the configured gap between articles.")
-        return False
     article_had_success = any(item["targets"].get(name) == "sent" for name in targets)
+    # Pacing limits apply between distinct articles. If one channel already
+    # accepted this item, allow the remaining channel(s) to complete it now.
+    if not article_had_success:
+        if sent_today[day] >= int(config.get("max_articles_per_day", 5)):
+            print(f"Daily cap reached ({sent_today[day]} articles). The queue will wait until tomorrow.")
+            return False
+        last_post = parse_datetime(state.get("last_article_posted_at"))
+        gap = max(0, float(config.get("minimum_hours_between_articles", 2)))
+        if last_post and (utcnow() - last_post).total_seconds() < gap * 3600:
+            print("Waiting for the configured gap between articles.")
+            return False
     article_had_new_success = False
     text = build_post_text(item)
     for name, channel_id in targets.items():

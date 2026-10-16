@@ -23,25 +23,33 @@ class WatcherTests(unittest.TestCase):
 
     def test_poll_queues_only_dated_items_newer_than_baseline(self):
         now = dt.datetime.now(dt.timezone.utc)
+        local_now = dt.datetime.now().astimezone()
         feed = {"title": "Test philosophy feed", "url": "https://example.com/feed"}
         fresh_url = "https://example.com/fresh"
         old_url = "https://example.com/old"
         undated_url = "https://example.com/undated"
+        yesterday_url = "https://example.com/yesterday"
+        yesterday = dt.datetime.combine(
+            local_now.date() - dt.timedelta(days=1), dt.time(23, 59), tzinfo=local_now.tzinfo
+        )
         items = [
             {"title": "New essay", "url": fresh_url, "published_at": (now - dt.timedelta(minutes=5)).isoformat(), "key": watcher.article_key(fresh_url)},
             {"title": "Old essay", "url": old_url, "published_at": (now - dt.timedelta(days=2)).isoformat(), "key": watcher.article_key(old_url)},
             {"title": "No timestamp", "url": undated_url, "published_at": None, "key": watcher.article_key(undated_url)},
+            {"title": "Yesterday's essay", "url": yesterday_url, "published_at": yesterday.isoformat(), "key": watcher.article_key(yesterday_url)},
         ]
-        state = {"baseline_at": (now - dt.timedelta(days=1)).isoformat(), "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {}}
+        state = {"baseline_at": (now - dt.timedelta(days=30)).isoformat(), "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {}}
         with patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
             count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60, "max_age_days_for_new_items": 30})
         self.assertEqual(count, 1)
         self.assertEqual([row["url"] for row in state["queue"]], [fresh_url])
         self.assertIn(watcher.article_key(old_url), state["seen"])
         self.assertIn(watcher.article_key(undated_url), state["seen"])
+        self.assertIn(watcher.article_key(yesterday_url), state["seen"])
 
     def test_publish_disabled_never_calls_buffer(self):
         item = {"title": "Test article", "url": "https://example.com/test", "source": "Test",
+                "published_at": watcher.iso(),
                 "targets": {"facebook": "pending", "x": "pending"}, "attempts": {"facebook": 0, "x": 0}}
         state = {"queue": [item]}
         output = io.StringIO()
@@ -117,6 +125,7 @@ class WatcherTests(unittest.TestCase):
         old = (now - dt.timedelta(hours=3)).isoformat()
         item = {
             "title": "Test article", "url": "https://example.com/test", "source": "Test",
+            "published_at": now.isoformat(),
             "targets": {"facebook": "retry", "x": "sent"},
             "attempts": {"facebook": 1, "x": 1}, "errors": {
                 "facebook": "previous rejection", "facebook_at": old,
@@ -157,6 +166,7 @@ class WatcherTests(unittest.TestCase):
             with self.subTest(label=label):
                 item = {
                     "title": "Test article", "url": "https://example.com/test", "source": "Test",
+                    "published_at": now.isoformat(),
                     "targets": {"facebook": "retry", "x": "sent"},
                     "attempts": {"facebook": 1, "x": 1}, "errors": {
                         "facebook": "previous rejection", "facebook_at": old,
@@ -181,6 +191,24 @@ class WatcherTests(unittest.TestCase):
                 self.assertEqual(item["targets"]["x"], "sent")
                 self.assertEqual(item["targets"]["facebook"], "sent")
                 self.assertEqual(state["queue"], [])
+
+    def test_publish_discards_previous_day_queue_items(self):
+        now = dt.datetime.now().astimezone()
+        yesterday = now - dt.timedelta(days=1)
+        item = {
+            "title": "Yesterday's article", "url": "https://example.com/yesterday", "source": "Test",
+            "published_at": yesterday.isoformat(),
+            "targets": {"facebook": "pending", "x": "pending"},
+            "attempts": {"facebook": 0, "x": 0},
+        }
+        state = {"queue": [item]}
+        output = io.StringIO()
+        with patch.object(watcher, "create_post", side_effect=AssertionError("must not publish")), \
+             contextlib.redirect_stdout(output):
+            result = watcher.try_publish(state, {"publishing_enabled": False})
+        self.assertFalse(result)
+        self.assertEqual(state["queue"], [])
+        self.assertIn("Discarded 1 queued article", output.getvalue())
 
 
 if __name__ == "__main__":
