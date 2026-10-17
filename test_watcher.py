@@ -64,6 +64,20 @@ class WatcherTests(unittest.TestCase):
         self.assertIn(literature, watcher.rank_candidates([literature], {}))
         self.assertIn(culture, watcher.rank_candidates([culture], {}))
 
+    def test_expanded_vocabulary_catches_common_subject_word_forms(self):
+        item = {
+            "title": "Ethical questions about mathematical discovery and artistic tradition",
+            "source": "Interdisciplinary Review",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        ranked = watcher.rank_candidates([item], {})
+        self.assertEqual(ranked, [item])
+        _, reasons = watcher.relevance_score(item)
+        combined = "; ".join(reasons)
+        self.assertIn("ethical", combined)
+        self.assertIn("mathematical", combined)
+        self.assertIn("artistic", combined)
+
     def test_personal_cat_shelter_post_is_rejected_even_from_sadler(self):
         personal = {
             "title": "My day at the local cat shelter",
