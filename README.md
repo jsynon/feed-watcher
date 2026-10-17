@@ -13,7 +13,7 @@ The watcher does not publish articles on the website, copy their full text, or l
 1. **Read the source list.** `feeds.opml` contains the `Feeds` folder from the Feedly export, currently 84 philosophy sources. The watcher fetches the feed URLs directly and parses them with Python’s `feedparser` dependency.
 2. **Establish a baseline.** The one-time baseline marks articles already present as seen, so setup does not publish a backlog. It creates `state.json` and never sends posts.
 3. **Find new articles.** Each feed is checked hourly by default. New items must have a publication date later than the baseline and on the current local calendar day. Undated, older, or prior-day items are marked seen but not queued. Canonicalized article links help prevent duplicates from tracking parameters.
-4. **Queue and publish at a measured pace.** The queue is ordered with older eligible articles first. The watcher sends at most one article per run and tracks Facebook and X separately; an article leaves the queue only after both channels accept it. Any unfinished item is discarded after its publication date ends, so articles never spill into the next day.
+4. **Rank and publish at a measured pace.** Eligible articles are scored from their title, feed summary, and categories using a transparent philosophy vocabulary. Matching topics/concepts and named thinkers raise the score; Gregory Sadler’s feeds receive a modest two-point source bonus. The preview prints scores and reasons for the top candidates. If a Sadler article was among the last three completed posts, another source is chosen while an eligible alternative exists. Repeated posts from other exact feed sources receive a small score penalty. No article is filtered out for a low score. An article already accepted by one channel is finished first, so cross-posts remain together. The watcher sends at most one article per run and tracks Facebook and X separately; an article leaves the queue only after both channels accept it. Any unfinished item is discarded after its publication date ends, so articles never spill into the next day.
 5. **Keep a local record.** `state.json` stores the baseline, seen links, queue, and destination statuses. `watcher.log` records feed errors and publishing results with local timestamps and timezone offsets, so the task can resume and be checked later.
 
 Posts contain the title, an optional `By: Author` line when a feed supplies an author, and the feed name as the source. X also gets the article URL. Facebook gets a regular post with a link attachment built from the article page’s Open Graph metadata when available, allowing Buffer to show its title, description, and image.
@@ -63,7 +63,7 @@ Edit the local `config.json`, which is created from `config.example.json`. Defau
 
 | File | What it does |
 | --- | --- |
-| `preview_queue.bat` | Shows the next queued article without publishing. |
+| `preview_queue.bat` | Shows the top eligible articles with relevance scores and reasons, without publishing. |
 | `check_status.bat` | Shows the baseline, latest poll, queue size, and feeds with errors. |
 | `run_once.bat` | Checks due feeds and processes at most one queued article. |
 | `list_buffer_channels.bat` | Lists connected Buffer channel IDs. |

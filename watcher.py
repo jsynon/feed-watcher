@@ -35,6 +35,28 @@ BUFFER_API = "https://api.buffer.com"
 USER_AGENT = "AntilogicalismFeedWatcher/1.0 (+local personal automation)"
 MAX_FEED_BYTES = 8 * 1024 * 1024
 
+# Transparent, deliberately broad vocabulary for ranking philosophy-related
+# articles. A match affects order only; it never excludes an article.
+PHILOSOPHY_TERMS = (
+    "philosophy", "philosophical", "ethics", "morality", "moral philosophy",
+    "political philosophy", "philosophy of mind", "philosophy of religion",
+    "epistemology", "metaphysics", "ontology", "aesthetics", "logic",
+    "phenomenology", "existentialism", "existential", "hermeneutics",
+    "epistemic", "consciousness", "free will", "virtue ethics", "justice",
+    "meaning of life", "being and time", "the good", "the sublime",
+)
+PHILOSOPHERS = (
+    "Socrates", "Plato", "Aristotle", "Epicurus", "Epictetus", "Marcus Aurelius",
+    "Augustine", "Aquinas", "Maimonides", "Ibn Sina", "Avicenna", "Ibn Rushd",
+    "Descartes", "Spinoza", "Leibniz", "Locke", "Berkeley", "Hume", "Kant",
+    "Hegel", "Schopenhauer", "Kierkegaard", "Marx", "Nietzsche", "Husserl",
+    "Heidegger", "Wittgenstein", "Sartre", "Simone de Beauvoir", "Simone Weil",
+    "Camus", "Foucault", "Derrida", "Arendt", "Levinas", "Buber", "Pascal",
+    "MacIntyre", "Charles Taylor", "Shestov", "Nishitani", "Eckhart", "Berdyaev",
+    "Girard", "Adorno", "Horkheimer", "Gregory Sadler", "Gregory B. Sadler",
+)
+SADLER_SOURCE_RE = re.compile(r"gregory\s*(?:b\.?\s*)?sadler|that philosophy guy", re.I)
+
 
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -170,10 +192,22 @@ def fetch_and_parse(feed: dict) -> tuple[dict, list[dict], str | None]:
             if published:
                 published_at = dt.datetime(*published[:6], tzinfo=dt.timezone.utc).isoformat(timespec="seconds")
             author = entry_author(entry)
+            summary = entry.get("summary") or entry.get("description") or ""
+            summary = html.unescape(re.sub(r"<[^>]*>", " ", str(summary)))
+            summary = re.sub(r"\s+", " ", summary).strip()
+            categories = []
+            for tag in entry.get("tags") or []:
+                term = tag.get("term") if hasattr(tag, "get") else str(tag)
+                if term:
+                    categories.append(re.sub(r"\s+", " ", str(term)).strip())
             item = {"title": title, "url": url, "published_at": published_at,
                     "key": article_key(url)}
             if author:
                 item["author"] = author
+            if summary:
+                item["summary"] = summary[:4000]
+            if categories:
+                item["categories"] = categories[:20]
             items.append(item)
         return feed, items, None if items or parsed.feed else "response was not recognized as a feed"
     except urllib.error.HTTPError as exc:
@@ -281,12 +315,16 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
             })
             if item.get("author"):
                 state["queue"][-1]["author"] = item["author"]
+            if item.get("summary"):
+                state["queue"][-1]["summary"] = item["summary"]
+            if item.get("categories"):
+                state["queue"][-1]["categories"] = item["categories"]
             new_count += 1
     state["last_check_result"] = "checked"
     state["last_check_feed_count"] = len(due)
     state["last_check_error_count"] = sum(1 for _, _, error in results if error)
     state["last_polled_at"] = iso(now)
-    # Older articles go first; stable order breaks ties by discovery time then title.
+    # Keep queue storage stable; selection is performed by the relevance ranker.
     state["queue"].sort(key=lambda x: (x.get("published_at") or "", x.get("queued_at") or "", x.get("title", "").casefold()))
     return new_count
 
@@ -426,6 +464,72 @@ def facebook_link_attachment(item: dict) -> dict:
     return attachment
 
 
+def source_group(item: dict) -> str:
+    source_and_author = f"{item.get('source', '')} {item.get('author', '')}"
+    if SADLER_SOURCE_RE.search(source_and_author):
+        return "gregory-sadler"
+    return re.sub(r"\s+", " ", str(item.get("source") or "Unknown source")).strip().casefold()
+
+
+def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tuple[int, list[str]]:
+    """Score article text and source, returning a score and readable reasons."""
+    text = " ".join([
+        str(item.get("title") or ""), str(item.get("summary") or ""),
+        str(item.get("author") or ""),
+        " ".join(str(value) for value in item.get("categories", [])),
+    ]).casefold()
+    topic_hits = [term for term in PHILOSOPHY_TERMS
+                  if re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", text)]
+    thinker_hits = [name for name in PHILOSOPHERS
+                    if re.search(r"(?<!\w)" + re.escape(name.casefold()) + r"(?!\w)", text)]
+    score = min(10, len(topic_hits) * 2) + min(8, len(thinker_hits) * 2)
+    reasons = []
+    if topic_hits:
+        reasons.append("philosophy topics: " + ", ".join(topic_hits[:5]))
+    if thinker_hits:
+        reasons.append("thinkers: " + ", ".join(thinker_hits[:5]))
+    group = source_group(item)
+    if group == "gregory-sadler":
+        score += 2
+        reasons.append("Gregory Sadler source (+2)")
+    elif group in (recent_sources or []):
+        score -= 2
+        reasons.append("recent source repetition (-2)")
+    if not reasons:
+        reasons.append("no vocabulary or source match")
+    return score, reasons
+
+
+def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
+    """Rank fresh candidates; finish any already-started cross-post first."""
+    pending = [item for item in queue if any(
+        value in {"pending", "retry"} for value in item.get("targets", {}).values()
+    )]
+    partial = [item for item in pending if any(
+        value == "sent" for value in item.get("targets", {}).values()
+    )]
+    if partial:
+        for item in partial:
+            item["_ranking_score"] = 0
+            item["_ranking_reasons"] = ["complete an article already accepted by one channel"]
+        return partial
+
+    recent = list(state.get("recent_posted_sources", []))[-3:]
+    sadler_count = recent.count("gregory-sadler")
+    non_sadler = [item for item in pending if source_group(item) != "gregory-sadler"]
+    # Keep Sadler prominent, while limiting him to one of the last three
+    # completed articles whenever another source has an eligible candidate.
+    candidates = non_sadler if sadler_count >= 1 and non_sadler else pending
+    for item in candidates:
+        score, reasons = relevance_score(item, recent)
+        item["_ranking_score"] = score
+        item["_ranking_reasons"] = reasons
+    return sorted(candidates, key=lambda item: (
+        -item["_ranking_score"], item.get("published_at") or "",
+        item.get("queued_at") or "", item.get("title", "").casefold()
+    ))
+
+
 def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     queue = state.get("queue", [])
     today = dt.datetime.now().astimezone().date()
@@ -435,14 +539,27 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     expired_count = original_count - len(queue)
     if expired_count:
         print(f"Discarded {expired_count} queued article(s) not published today.")
-    item = next((entry for entry in queue if any(v in {"pending", "retry"} for v in entry["targets"].values())), None)
-    if item is None:
+    ranked = rank_candidates(queue, state)
+    if not ranked:
         print("Queue is empty; nothing to preview." if dry_run else "Queue is empty; nothing to publish.")
         return False
+    item = ranked[0]
     if dry_run or not config.get("publishing_enabled"):
-        print("PUBLISHING IS OFF. Next queued article:")
-        print(f"  {item['title']}\n  {item['url']}\n  source: {item['source']}")
+        prefix = "DRY RUN." if dry_run else "PUBLISHING IS OFF."
+        print(f"{prefix} Highest-ranked eligible article:")
+        for candidate in ranked[:5]:
+            score = candidate.get("_ranking_score")
+            reasons = candidate.get("_ranking_reasons", [])
+            print(f"  [{score:+d}] {candidate['title']} — {candidate.get('source', 'Unknown source')}")
+            print(f"      Why: {'; '.join(reasons)}")
+            print(f"      {candidate['url']}")
+        if len(ranked) > 1:
+            print("Scores rank eligible candidates; ties favor earlier publication dates.")
         return False
+    item.pop("_ranking_score", None)
+    item.pop("_ranking_reasons", None)
+    selected_score, selected_reasons = relevance_score(item, list(state.get("recent_posted_sources", []))[-3:])
+    print(f"Selected by relevance (score {selected_score:+d}): {'; '.join(selected_reasons)}")
     values = load_dotenv()
     api_key = values.get("BUFFER_API_KEY") or os.environ.get("BUFFER_API_KEY")
     targets = {"facebook": config.get("facebook_channel_id", ""), "x": config.get("x_channel_id", "")}
@@ -527,6 +644,9 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
         state["last_article_posted_at"] = iso(utcnow())
     # Remove only after both destinations have accepted it.
     if all(item["targets"].get(name) == "sent" for name in targets):
+        recent = state.setdefault("recent_posted_sources", [])
+        recent.append(source_group(item))
+        del recent[:-3]
         queue.remove(item)
         print("Cross-post complete; article removed from the queue.")
     else:

@@ -21,9 +21,32 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(watcher.canonical_url(first), watcher.canonical_url(second))
         self.assertEqual(watcher.article_key(first), watcher.article_key(second))
 
+    def test_relevance_score_rewards_topics_thinkers_and_sadler_modestly(self):
+        generic = {"title": "A new essay", "source": "Independent Journal"}
+        philosophical = {"title": "Kant on moral philosophy and justice", "source": "Independent Journal"}
+        sadler = {"title": "A new essay", "source": "Gregory B. Sadler - That Philosophy Guy"}
+        generic_score, _ = watcher.relevance_score(generic)
+        philosophy_score, reasons = watcher.relevance_score(philosophical)
+        sadler_score, sadler_reasons = watcher.relevance_score(sadler)
+        self.assertGreater(philosophy_score, generic_score)
+        self.assertIn("thinkers: Kant", "; ".join(reasons))
+        self.assertEqual(sadler_score, generic_score + 2)
+        self.assertTrue(any("Gregory Sadler" in reason for reason in sadler_reasons))
+
+    def test_sadler_is_deprioritized_when_recently_posted_and_alternatives_exist(self):
+        sadler = {"title": "Aristotle on virtue ethics", "source": "Gregory Sadler Substack",
+                  "published_at": "2026-10-17T10:00:00+00:00", "targets": {"facebook": "pending", "x": "pending"}}
+        other = {"title": "A note on metaphysics", "source": "Another Journal",
+                 "published_at": "2026-10-17T09:00:00+00:00", "targets": {"facebook": "pending", "x": "pending"}}
+        ranked = watcher.rank_candidates([sadler, other], {"recent_posted_sources": ["gregory-sadler"]})
+        self.assertIs(ranked[0], other)
+        # Without a recent Sadler post, his topic score plus source bonus wins.
+        ranked = watcher.rank_candidates([sadler, other], {})
+        self.assertIs(ranked[0], sadler)
+
     def test_poll_queues_only_dated_items_newer_than_baseline(self):
-        now = dt.datetime.now(dt.timezone.utc)
         local_now = dt.datetime.now().astimezone()
+        now = dt.datetime.combine(local_now.date(), dt.time(12, 0), tzinfo=local_now.tzinfo).astimezone(dt.timezone.utc)
         feed = {"title": "Test philosophy feed", "url": "https://example.com/feed"}
         fresh_url = "https://example.com/fresh"
         old_url = "https://example.com/old"
