@@ -35,8 +35,7 @@ BUFFER_API = "https://api.buffer.com"
 USER_AGENT = "AntilogicalismFeedWatcher/1.0 (+local personal automation)"
 MAX_FEED_BYTES = 8 * 1024 * 1024
 
-# Transparent, deliberately broad vocabulary for ranking philosophy-related
-# articles. A match affects order only; it never excludes an article.
+# Transparent, deliberately broad vocabularies for the subjects Antilogicalism curates.
 PHILOSOPHY_TERMS = (
     "philosophy", "philosophical", "ethics", "morality", "moral philosophy",
     "political philosophy", "philosophy of mind", "philosophy of religion",
@@ -45,6 +44,42 @@ PHILOSOPHY_TERMS = (
     "epistemic", "consciousness", "free will", "virtue ethics", "justice",
     "meaning of life", "being and time", "the good", "the sublime",
 )
+SCIENCE_TERMS = (
+    "science", "scientific", "mathematics", "math", "number theory", "geometry",
+    "topology", "statistics", "probability", "theorem", "algorithm", "computer science",
+    "artificial intelligence", "machine learning", "neural network", "information theory",
+    "physics", "quantum", "quantum mechanics", "relativity", "particle physics",
+    "astrophysics", "astronomy", "cosmology", "black hole", "universe", "biology",
+    "biological", "evolution", "genetics", "genome", "ecology", "neuroscience",
+    "cognitive science", "chemistry", "molecule", "protein", "cell", "microbiology",
+    "climate", "geology", "earth science", "paleontology", "health", "medicine",
+    "medical", "disease", "cancer", "nutrition", "obesity", "epidemiology",
+    "clinical", "public health", "human body", "research study",
+)
+LITERATURE_TERMS = (
+    "literature", "literary", "novel", "novels", "fiction", "poetry", "poem",
+    "poems", "poet", "poets", "short story", "short stories", "literary criticism",
+    "literary theory", "narrative", "narratives", "drama", "playwright", "Shakespeare",
+    "Homer", "Dante", "Dostoevsky", "Tolstoy", "Kafka", "James Joyce", "Virginia Woolf",
+    "Borges", "James Baldwin", "Toni Morrison", "Cervantes", "Milton", "Dickens",
+)
+CULTURE_TERMS = (
+    "culture", "cultural", "cultural criticism", "popular culture", "pop culture",
+    "the arts", "art history", "painting", "sculpture", "music", "film", "cinema",
+    "television", "media", "theater", "theatre", "performance", "visual art",
+    "religion", "religious", "theology", "ritual", "folklore", "myth", "mythology",
+    "language", "cultural history",
+)
+PERSONAL_CONTENT_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
+    r"\bpersonal\s+(?:life|update|blog|story)\b",
+    r"\blife\s+(?:update|story|journal|lately)\b",
+    r"\b(?:a\s+)?(?:day|week)\s+in\s+my\s+life\b",
+    r"\bmy\s+(?:life|story|family|cat|cats|dog|dogs|pet|pets|weekend|daily routine)\b",
+    r"\b(?:cat|animal|pet)\s+shelter\b",
+    r"\b(?:visit(?:ing)?|volunteer(?:ing)?)\s+(?:at|to)\s+(?:the\s+)?(?:local\s+)?(?:cat|animal|pet)\s+shelter\b",
+    r"\bvolunteer(?:ing)?\s+at\s+(?:the\s+)?shelter\b",
+    r"\bwhat\s+i\s+did\s+this\s+weekend\b", r"\bweekend\s+update\b",
+))
 PHILOSOPHERS = (
     "Socrates", "Plato", "Aristotle", "Epicurus", "Epictetus", "Marcus Aurelius",
     "Augustine", "Aquinas", "Maimonides", "Ibn Sina", "Avicenna", "Ibn Rushd",
@@ -56,6 +91,7 @@ PHILOSOPHERS = (
     "Girard", "Adorno", "Horkheimer", "Gregory Sadler", "Gregory B. Sadler",
 )
 SADLER_SOURCE_RE = re.compile(r"gregory\s*(?:b\.?\s*)?sadler|that philosophy guy", re.I)
+QUANTA_SOURCE_RE = re.compile(r"quanta(?:\s+magazine)?", re.I)
 
 
 def utcnow() -> dt.datetime:
@@ -468,37 +504,66 @@ def source_group(item: dict) -> str:
     source_and_author = f"{item.get('source', '')} {item.get('author', '')}"
     if SADLER_SOURCE_RE.search(source_and_author):
         return "gregory-sadler"
+    if QUANTA_SOURCE_RE.search(str(item.get("source") or "")):
+        return "quanta-magazine"
     return re.sub(r"\s+", " ", str(item.get("source") or "Unknown source")).strip().casefold()
 
 
-def relevance_matches(item: dict) -> tuple[list[str], list[str]]:
-    """Return philosophy-topic and thinker matches in article metadata."""
-    text = " ".join([
+def relevance_text(item: dict) -> str:
+    """Return article content fields, excluding feed/source and author labels."""
+    return " ".join([
         str(item.get("title") or ""), str(item.get("summary") or ""),
-        str(item.get("author") or ""),
         " ".join(str(value) for value in item.get("categories", [])),
     ]).casefold()
+
+
+def is_personal_content(item: dict) -> bool:
+    """Detect explicit personal-life and personal-activity posts."""
+    text = relevance_text(item)
+    return any(pattern.search(text) for pattern in PERSONAL_CONTENT_PATTERNS)
+
+
+def relevance_matches(item: dict) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """Return philosophy, thinker, science, literature, and culture matches."""
+    text = relevance_text(item)
     topic_hits = [term for term in PHILOSOPHY_TERMS
                   if re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", text)]
     thinker_hits = [name for name in PHILOSOPHERS
                     if re.search(r"(?<!\w)" + re.escape(name.casefold()) + r"(?!\w)", text)]
-    return topic_hits, thinker_hits
+    science_hits = [term for term in SCIENCE_TERMS
+                    if re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", text)]
+    literature_hits = [term for term in LITERATURE_TERMS
+                       if re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", text)]
+    culture_hits = [term for term in CULTURE_TERMS
+                    if re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", text)]
+    return topic_hits, thinker_hits, science_hits, literature_hits, culture_hits
 
 
 def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tuple[int, list[str]]:
     """Score article text and source, returning a score and readable reasons."""
-    topic_hits, thinker_hits = relevance_matches(item)
-    score = min(10, len(topic_hits) * 2) + min(8, len(thinker_hits) * 2)
+    topic_hits, thinker_hits, science_hits, literature_hits, culture_hits = relevance_matches(item)
+    score = (min(10, len(topic_hits) * 2) + min(8, len(thinker_hits) * 2) +
+             min(10, len(science_hits) * 2) + min(8, len(literature_hits) * 2) +
+             min(8, len(culture_hits) * 2))
     reasons = []
     if topic_hits:
         reasons.append("philosophy topics: " + ", ".join(topic_hits[:5]))
     if thinker_hits:
         reasons.append("thinkers: " + ", ".join(thinker_hits[:5]))
+    if science_hits:
+        reasons.append("science topics: " + ", ".join(science_hits[:5]))
+    if literature_hits:
+        reasons.append("literature topics: " + ", ".join(literature_hits[:5]))
+    if culture_hits:
+        reasons.append("culture topics: " + ", ".join(culture_hits[:5]))
     group = source_group(item)
     if group == "gregory-sadler":
         score += 2
         reasons.append("Gregory Sadler source (+2)")
-    elif group in (recent_sources or []):
+    if group == "quanta-magazine":
+        score += 2
+        reasons.append("Quanta Magazine source (+2)")
+    if group in (recent_sources or []) and group != "gregory-sadler":
         score -= 2
         reasons.append("recent source repetition (-2)")
     if not reasons:
@@ -520,9 +585,10 @@ def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
             item["_ranking_reasons"] = ["complete an article already accepted by one channel"]
         return partial
 
-    # A source bonus can reorder relevant items, but cannot make an unrelated
-    # article eligible by itself. Low-match items remain queued until midnight.
-    pending = [item for item in pending if any(relevance_matches(item))]
+    # Source bonuses can reorder relevant items, but cannot make an unrelated
+    # article eligible by themselves. Low-match items remain queued until midnight.
+    pending = [item for item in pending
+               if not is_personal_content(item) and any(relevance_matches(item))]
     recent = list(state.get("recent_posted_sources", []))[-3:]
     sadler_count = recent.count("gregory-sadler")
     non_sadler = [item for item in pending if source_group(item) != "gregory-sadler"]
@@ -554,7 +620,7 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
             value in {"pending", "retry"} for value in entry.get("targets", {}).values()
         )]
         if pending:
-            print(f"No queued article matches the philosophy relevance filter; {len(pending)} item(s) held until midnight expiry.")
+            print(f"No queued article passed the subject and personal-content filters; {len(pending)} item(s) held until midnight expiry.")
         else:
             print("Queue is empty; nothing to preview." if dry_run else "Queue is empty; nothing to publish.")
         return False

@@ -33,6 +33,48 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(sadler_score, generic_score + 2)
         self.assertTrue(any("Gregory Sadler" in reason for reason in sadler_reasons))
 
+    def test_science_articles_qualify_and_quanta_gets_a_modest_source_bonus(self):
+        quanta = {
+            "title": "A new result in quantum physics",
+            "source": "Quanta Magazine",
+            "published_at": "2026-10-17T10:00:00+00:00",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        general_science = {
+            "title": "A new result in quantum physics",
+            "source": "Science Journal",
+            "published_at": "2026-10-17T10:00:00+00:00",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertEqual(watcher.rank_candidates([quanta], {})[0], quanta)
+        quanta_score, reasons = watcher.relevance_score(quanta)
+        other_score, _ = watcher.relevance_score(general_science)
+        self.assertEqual(quanta_score, other_score + 2)
+        self.assertTrue(any("science topics" in reason for reason in reasons))
+
+    def test_literature_and_culture_articles_are_eligible(self):
+        literature = {
+            "title": "Reading Dostoevsky through the modern novel",
+            "source": "Literary Review", "targets": {"facebook": "pending", "x": "pending"},
+        }
+        culture = {
+            "title": "How popular culture reshapes our view of myth",
+            "source": "Culture Journal", "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertIn(literature, watcher.rank_candidates([literature], {}))
+        self.assertIn(culture, watcher.rank_candidates([culture], {}))
+
+    def test_personal_cat_shelter_post_is_rejected_even_from_sadler(self):
+        personal = {
+            "title": "My day at the local cat shelter",
+            "summary": "Gregory Sadler talks about philosophy while visiting cats.",
+            "author": "Gregory B. Sadler",
+            "source": "Gregory B. Sadler - That Philosophy Guy",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertTrue(watcher.is_personal_content(personal))
+        self.assertEqual(watcher.rank_candidates([personal], {}), [])
+
     def test_sadler_is_deprioritized_when_recently_posted_and_alternatives_exist(self):
         sadler = {"title": "Aristotle on virtue ethics", "source": "Gregory Sadler Substack",
                   "published_at": "2026-10-17T10:00:00+00:00", "targets": {"facebook": "pending", "x": "pending"}}
@@ -46,7 +88,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_source_bonus_does_not_make_unrelated_article_eligible(self):
         unrelated = {
-            "title": "Can We Ditch BMI for an Obesity Index?",
+            "title": "A new article about local gardening",
             "source": "Gregory B. Sadler - That Philosophy Guy",
             "published_at": "2026-10-17T10:00:00+00:00",
             "targets": {"facebook": "pending", "x": "pending"},
@@ -55,7 +97,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_preview_holds_unrelated_article_without_publishing(self):
         item = {
-            "title": "Can We Ditch BMI for an Obesity Index?",
+            "title": "A new guide to summer gadgets",
             "source": "Nautilus", "url": "https://example.com/health",
             "published_at": watcher.iso(),
             "targets": {"facebook": "pending", "x": "pending"},
@@ -64,7 +106,7 @@ class WatcherTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             watcher.try_publish(state, {"publishing_enabled": False}, dry_run=True)
-        self.assertIn("No queued article matches the philosophy relevance filter", output.getvalue())
+        self.assertIn("No queued article passed the subject and personal-content filters", output.getvalue())
         self.assertEqual(state["queue"], [item])
 
     def test_poll_queues_only_dated_items_newer_than_baseline(self):
