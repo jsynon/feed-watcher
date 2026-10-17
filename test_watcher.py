@@ -44,6 +44,29 @@ class WatcherTests(unittest.TestCase):
         ranked = watcher.rank_candidates([sadler, other], {})
         self.assertIs(ranked[0], sadler)
 
+    def test_source_bonus_does_not_make_unrelated_article_eligible(self):
+        unrelated = {
+            "title": "Can We Ditch BMI for an Obesity Index?",
+            "source": "Gregory B. Sadler - That Philosophy Guy",
+            "published_at": "2026-10-17T10:00:00+00:00",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertEqual(watcher.rank_candidates([unrelated], {}), [])
+
+    def test_preview_holds_unrelated_article_without_publishing(self):
+        item = {
+            "title": "Can We Ditch BMI for an Obesity Index?",
+            "source": "Nautilus", "url": "https://example.com/health",
+            "published_at": watcher.iso(),
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        state = {"queue": [item]}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            watcher.try_publish(state, {"publishing_enabled": False}, dry_run=True)
+        self.assertIn("No queued article matches the philosophy relevance filter", output.getvalue())
+        self.assertEqual(state["queue"], [item])
+
     def test_poll_queues_only_dated_items_newer_than_baseline(self):
         local_now = dt.datetime.now().astimezone()
         now = dt.datetime.combine(local_now.date(), dt.time(12, 0), tzinfo=local_now.tzinfo).astimezone(dt.timezone.utc)
@@ -71,7 +94,7 @@ class WatcherTests(unittest.TestCase):
         self.assertIn(watcher.article_key(yesterday_url), state["seen"])
 
     def test_publish_disabled_never_calls_buffer(self):
-        item = {"title": "Test article", "url": "https://example.com/test", "source": "Test",
+        item = {"title": "A philosophy test article", "url": "https://example.com/test", "source": "Test",
                 "published_at": watcher.iso(),
                 "targets": {"facebook": "pending", "x": "pending"}, "attempts": {"facebook": 0, "x": 0}}
         state = {"queue": [item]}

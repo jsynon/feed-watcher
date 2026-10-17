@@ -471,8 +471,8 @@ def source_group(item: dict) -> str:
     return re.sub(r"\s+", " ", str(item.get("source") or "Unknown source")).strip().casefold()
 
 
-def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tuple[int, list[str]]:
-    """Score article text and source, returning a score and readable reasons."""
+def relevance_matches(item: dict) -> tuple[list[str], list[str]]:
+    """Return philosophy-topic and thinker matches in article metadata."""
     text = " ".join([
         str(item.get("title") or ""), str(item.get("summary") or ""),
         str(item.get("author") or ""),
@@ -482,6 +482,12 @@ def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tupl
                   if re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", text)]
     thinker_hits = [name for name in PHILOSOPHERS
                     if re.search(r"(?<!\w)" + re.escape(name.casefold()) + r"(?!\w)", text)]
+    return topic_hits, thinker_hits
+
+
+def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tuple[int, list[str]]:
+    """Score article text and source, returning a score and readable reasons."""
+    topic_hits, thinker_hits = relevance_matches(item)
     score = min(10, len(topic_hits) * 2) + min(8, len(thinker_hits) * 2)
     reasons = []
     if topic_hits:
@@ -501,7 +507,7 @@ def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tupl
 
 
 def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
-    """Rank fresh candidates; finish any already-started cross-post first."""
+    """Rank relevant fresh candidates; finish any started cross-post first."""
     pending = [item for item in queue if any(
         value in {"pending", "retry"} for value in item.get("targets", {}).values()
     )]
@@ -514,6 +520,9 @@ def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
             item["_ranking_reasons"] = ["complete an article already accepted by one channel"]
         return partial
 
+    # A source bonus can reorder relevant items, but cannot make an unrelated
+    # article eligible by itself. Low-match items remain queued until midnight.
+    pending = [item for item in pending if any(relevance_matches(item))]
     recent = list(state.get("recent_posted_sources", []))[-3:]
     sadler_count = recent.count("gregory-sadler")
     non_sadler = [item for item in pending if source_group(item) != "gregory-sadler"]
@@ -541,7 +550,13 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
         print(f"Discarded {expired_count} queued article(s) not published today.")
     ranked = rank_candidates(queue, state)
     if not ranked:
-        print("Queue is empty; nothing to preview." if dry_run else "Queue is empty; nothing to publish.")
+        pending = [entry for entry in queue if any(
+            value in {"pending", "retry"} for value in entry.get("targets", {}).values()
+        )]
+        if pending:
+            print(f"No queued article matches the philosophy relevance filter; {len(pending)} item(s) held until midnight expiry.")
+        else:
+            print("Queue is empty; nothing to preview." if dry_run else "Queue is empty; nothing to publish.")
         return False
     item = ranked[0]
     if dry_run or not config.get("publishing_enabled"):
