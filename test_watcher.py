@@ -123,6 +123,26 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("No queued article passed the subject and personal-content filters", output.getvalue())
         self.assertEqual(state["queue"], [item])
 
+    def test_generic_health_match_alone_does_not_qualify_supplementary_article(self):
+        item = {
+            "title": "Teen Girls Are Now More Likely to Vape Than Boys",
+            "summary": "Smokers gained a way to get nicotine without negative health effects.",
+            "categories": ["Health"], "source": "Nautilus",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertFalse(watcher.has_subject_relevance(item))
+        self.assertEqual(watcher.rank_candidates([item], {}), [])
+
+    def test_two_distinct_supplementary_content_signals_qualify(self):
+        item = {
+            "title": "A new finding",
+            "summary": "Researchers report a mathematical result in a study.",
+            "categories": ["Science"], "source": "Quanta Magazine",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertTrue(watcher.has_subject_relevance(item))
+        self.assertEqual(watcher.rank_candidates([item], {}), [item])
+
     def test_poll_queues_only_dated_items_newer_than_baseline(self):
         local_now = dt.datetime.now().astimezone()
         now = dt.datetime.combine(local_now.date(), dt.time(12, 0), tzinfo=local_now.tzinfo).astimezone(dt.timezone.utc)

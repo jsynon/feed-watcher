@@ -180,7 +180,7 @@ def load_config() -> dict:
         "x_channel_id": "",
         "poll_interval_minutes": 60,
         "minimum_hours_between_articles": 1,
-        "max_articles_per_day": 10,
+        "max_articles_per_day": 15,
         "max_auto_retries": 3,
         "retry_wait_minutes": 60
     }
@@ -555,6 +555,34 @@ def relevance_matches(item: dict) -> tuple[list[str], list[str], list[str], list
     return topic_hits, thinker_hits, science_hits, literature_hits, culture_hits
 
 
+def has_subject_relevance(item: dict) -> bool:
+    """Require stronger article-text evidence for supplementary subjects.
+
+    A philosophy topic or named thinker can qualify on one content match.
+    Science, literature, and culture need a matching title or two distinct
+    content terms. Feed categories can affect ranking but cannot qualify an
+    article by themselves.
+    """
+    content = {
+        "title": str(item.get("title") or ""),
+        "summary": str(item.get("summary") or ""),
+        "categories": [],
+    }
+    topic, thinker, science, literature, culture = relevance_matches(content)
+    if topic or thinker:
+        return True
+
+    supplementary = set(science + literature + culture)
+    if not supplementary:
+        return False
+
+    title_only = {"title": content["title"], "summary": "", "categories": []}
+    _, _, title_science, title_literature, title_culture = relevance_matches(title_only)
+    if title_science or title_literature or title_culture:
+        return True
+    return len(supplementary) >= 2
+
+
 def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tuple[int, list[str]]:
     """Score article text and source, returning a score and readable reasons."""
     topic_hits, thinker_hits, science_hits, literature_hits, culture_hits = relevance_matches(item)
@@ -604,7 +632,7 @@ def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
     # Source bonuses can reorder relevant items, but cannot make an unrelated
     # article eligible by themselves. Low-match items remain queued until midnight.
     pending = [item for item in pending
-               if not is_personal_content(item) and any(relevance_matches(item))]
+               if not is_personal_content(item) and has_subject_relevance(item)]
     recent = list(state.get("recent_posted_sources", []))[-3:]
     sadler_count = recent.count("gregory-sadler")
     non_sadler = [item for item in pending if source_group(item) != "gregory-sadler"]
@@ -670,7 +698,7 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     # Pacing limits apply between distinct articles. If one channel already
     # accepted this item, allow the remaining channel(s) to complete it now.
     if not article_had_success:
-        if sent_today[day] >= int(config.get("max_articles_per_day", 5)):
+        if sent_today[day] >= int(config.get("max_articles_per_day", 15)):
             print(f"Daily cap reached ({sent_today[day]} articles). The queue will wait until tomorrow.")
             return False
         last_post = parse_datetime(state.get("last_article_posted_at"))
