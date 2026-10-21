@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import datetime as dt
 import hashlib
 import html
@@ -31,6 +32,7 @@ CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "state.json"
 ENV_PATH = ROOT / ".env"
 LOG_PATH = ROOT / "watcher.log"
+REJECTIONS_PATH = ROOT / "rejected_articles.csv"
 BUFFER_API = "https://api.buffer.com"
 USER_AGENT = "AntilogicalismFeedWatcher/1.0 (+local personal automation)"
 MAX_FEED_BYTES = 8 * 1024 * 1024
@@ -319,6 +321,89 @@ def do_baseline() -> int:
     return 0
 
 
+REJECTION_FIELDS = (
+    "discovered_at", "source", "title", "author", "published_at",
+    "rejection_reason", "matched_topics", "url",
+)
+
+
+def article_rejection_reasons(item: dict, baseline: dt.datetime, today: dt.date) -> list[str]:
+    """Explain why a newly discovered article is ineligible for today's queue."""
+    reasons = []
+    published = parse_datetime(item.get("published_at"))
+    if not published:
+        reasons.append("Publication-date filter: feed item has no valid publication date")
+    elif published <= baseline:
+        reasons.append("Publication-date filter: article predates the watcher baseline")
+    elif published.astimezone().date() != today:
+        reasons.append("Publication-date filter: article was not published today (local date)")
+    if is_personal_content(item):
+        reasons.append("Personal-content filter: title or summary matches a personal-life pattern")
+    if not has_subject_relevance(item):
+        reasons.append("Subject-relevance filter: no qualifying topic match in the title or summary")
+    return reasons
+
+
+def rejection_topic_matches(item: dict) -> str:
+    """Summarize topic and thinker terms found in title/summary, excluding feed tags."""
+    content = {
+        "title": str(item.get("title") or ""),
+        "summary": str(item.get("summary") or ""),
+        "categories": [],
+    }
+    labels = ("philosophy", "thinkers", "science", "literature", "culture")
+    matches = relevance_matches(content)
+    return "; ".join(
+        f"{label}: {', '.join(hits)}"
+        for label, hits in zip(labels, matches) if hits
+    )
+
+
+def append_rejection_report(rows: list[dict]) -> int:
+    """Add new rejected articles to a local, de-duplicated CSV review report."""
+    if not rows:
+        return 0
+
+    existing = []
+    known_keys = set()
+    if REJECTIONS_PATH.exists():
+        with REJECTIONS_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                url = canonical_url(row.get("url") or "")
+                if not url:
+                    continue
+                key = article_key(url)
+                if key not in known_keys:
+                    known_keys.add(key)
+                    existing.append({field: row.get(field, "") for field in REJECTION_FIELDS})
+
+    added = []
+    for row in rows:
+        key = row.get("key") or article_key(row.get("url") or "")
+        if key and key not in known_keys:
+            known_keys.add(key)
+            added.append({field: row.get(field, "") for field in REJECTION_FIELDS})
+
+    if not added:
+        return 0
+
+    REJECTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=REJECTIONS_PATH.name + ".", suffix=".tmp", dir=REJECTIONS_PATH.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=REJECTION_FIELDS)
+            writer.writeheader()
+            writer.writerows(existing)
+            writer.writerows(added)
+        os.replace(temp_name, REJECTIONS_PATH)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    return len(added)
+
+
 def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False) -> int:
     if feedparser is None:
         raise RuntimeError("feedparser is not installed; run setup.bat first.")
@@ -336,9 +421,11 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
         state["last_check_result"] = "not_due"
         state["last_check_feed_count"] = 0
         state["last_check_error_count"] = 0
+        state["last_rejection_count"] = 0
         return 0
     results = fetch_many(due)
     new_count = 0
+    rejected_rows = []
     today = now.astimezone().date()
     for feed, items, error in results:
         url = feed["url"]
@@ -351,12 +438,34 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
             key = item["key"]
             if key in state.setdefault("seen", {}):
                 continue
+            article = {**item, "source": feed["title"]}
+            reasons = article_rejection_reasons(article, baseline, today)
+            if reasons:
+                rejected_rows.append({
+                    "key": key,
+                    "discovered_at": iso(now),
+                    "source": feed["title"],
+                    "title": item["title"],
+                    "author": item.get("author", ""),
+                    "published_at": item.get("published_at") or "",
+                    "rejection_reason": "; ".join(reasons),
+                    "matched_topics": rejection_topic_matches(article),
+                    "url": item["url"],
+                })
             published = parse_datetime(item.get("published_at"))
             # Only publish an article on its local calendar publication date.
             # Undated, pre-baseline, and prior-day items are marked seen and skipped.
             if (not published or published <= baseline or
                     published.astimezone().date() != today):
-                state["seen"][key] = {"url": item["url"], "seen_at": iso(now), "skipped": True}
+                date_reason = next(
+                    (reason for reason in reasons if reason.startswith("Publication-date filter:")),
+                    "Publication-date filter: outside the eligible publication window",
+                )
+                state["seen"][key] = {
+                    "url": item["url"], "seen_at": iso(now), "skipped": True,
+                    "title": item["title"], "source": feed["title"],
+                    "published_at": item.get("published_at"), "skip_reason": date_reason,
+                }
                 continue
             state["seen"][key] = {"url": item["url"], "seen_at": iso(now)}
             state.setdefault("queue", []).append({
@@ -372,6 +481,7 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
             if item.get("categories"):
                 state["queue"][-1]["categories"] = item["categories"]
             new_count += 1
+    state["last_rejection_count"] = append_rejection_report(rejected_rows)
     state["last_check_result"] = "checked"
     state["last_check_feed_count"] = len(due)
     state["last_check_error_count"] = sum(1 for _, _, error in results if error)
@@ -857,6 +967,9 @@ def main() -> int:
         if not state.get("baseline_at"):
             raise RuntimeError("No baseline exists yet. Run setup_baseline.bat first.")
         added = poll_feeds(state, feeds, config)
+        rejected = int(state.get("last_rejection_count", 0))
+        if rejected:
+            print(f"Logged {rejected} newly rejected article(s) to rejected_articles.csv.")
         if added:
             print(f"Queued {added} new article(s).")
         elif state.get("last_check_result") == "not_due":
