@@ -53,6 +53,19 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(quanta_score, other_score + 2)
         self.assertTrue(any("science topics" in reason for reason in reasons))
 
+
+    def test_quanta_cell_microscopy_article_is_eligible(self):
+        article = {
+            "title": "See Inside Cells Like Never Before in These Vivid Microscopic Images",
+            "source": "Quanta Magazine",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertEqual(watcher.rank_candidates([article], {}), [article])
+        _, reasons = watcher.relevance_score(article)
+        self.assertTrue(any("science topics: cells" in reason for reason in reasons))
+        self.assertTrue(any("microscopic" in reason for reason in reasons))
+
+
     def test_literature_and_culture_articles_are_eligible(self):
         literature = {
             "title": "Reading Dostoevsky through the modern novel",
