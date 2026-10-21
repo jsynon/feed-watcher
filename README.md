@@ -59,11 +59,20 @@ Edit the local `config.json`, which is created from `config.example.json`. Defau
 | `max_auto_retries` | `3` | Maximum attempts for a rejected destination before manual review. |
 | `retry_wait_minutes` | `60` | Wait before retrying a rejected post. |
 
+## Building a semantic review sample
+
+Run `semantic_sample.bat` to fetch the latest entries exposed by the RSS/Atom feeds in `feeds.opml` and export a source-balanced sample for manual review. By default, it selects up to 60 unique articles, with no more than two from any one source, and saves them to a new timestamped `semantic_review_sample_*.csv` file. The most recently published entries from each feed are considered first.
+
+This is a read-only research helper: it does not read or change `state.json`, the publishing queue, configuration, credentials, or the rejection report, and it never calls Buffer. A feed error is reported while usable entries from other feeds can still be exported. The sample CSV is ignored by Git so your labels and notes stay local.
+
+In the spreadsheet, fill `reviewer_label` with `relevant`, `not relevant`, or `uncertain`. Judge each article individually: include philosophy and intellectually substantial science such as Quanta’s work, along with literature and cultural criticism; mark personal-life updates or articles with only a weak subject connection as not relevant. Use `reviewer_notes` when the title and feed summary do not provide enough context. The labels will let us compare a semantic approach against the current filter before changing publishing behavior.
+
 ## Checking and controlling the watcher
 
 | File | What it does |
 | --- | --- |
 | `preview_queue.bat` | Shows the top eligible articles with relevance scores and reasons, without publishing. |
+| `semantic_sample.bat` | Exports a source-balanced article sample for relevance review, without changing watcher state or publishing. |
 | `review_rejections.bat` | Opens `rejected_articles.csv` to review articles held back by the date, personal-content, or subject-relevance filters. |
 | `check_status.bat` | Shows the baseline, latest poll, queue size, and feeds with errors. |
 | `run_once.bat` | Checks due feeds and processes at most one queued article. |

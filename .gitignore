@@ -9,6 +9,7 @@ config.json
 state.json
 watcher.log
 rejected_articles.csv
+semantic_review_sample*.csv
 
 # Python cache files
 __pycache__/
