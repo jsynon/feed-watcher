@@ -338,7 +338,7 @@ def article_rejection_reasons(item: dict, baseline: dt.datetime, today: dt.date)
     elif published.astimezone().date() != today:
         reasons.append("Publication-date filter: article was not published today (local date)")
     if is_personal_content(item):
-        reasons.append("Personal-content filter: title or summary matches a personal-life pattern")
+        reasons.append("Personal-content filter: article fields match a personal-life pattern")
     if not has_subject_relevance(item):
         reasons.append("Subject-relevance filter: no qualifying topic match in the title or summary")
     return reasons
@@ -404,6 +404,23 @@ def append_rejection_report(rows: list[dict]) -> int:
     return len(added)
 
 
+
+def flush_rejection_report(state: dict) -> int:
+    """Write pending report rows without letting a locked CSV stop publishing."""
+    pending = state.setdefault("pending_rejections", [])
+    if not pending:
+        state.pop("last_rejection_error", None)
+        return 0
+    try:
+        added = append_rejection_report(pending)
+    except OSError as exc:
+        state["last_rejection_error"] = f"{type(exc).__name__}: {exc}"
+        return 0
+    state["pending_rejections"] = []
+    state.pop("last_rejection_error", None)
+    return added
+
+
 def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False) -> int:
     if feedparser is None:
         raise RuntimeError("feedparser is not installed; run setup.bat first.")
@@ -411,6 +428,7 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
     if not baseline:
         raise RuntimeError("No baseline exists yet. Run setup_baseline.bat first.")
     now = utcnow()
+    report_count = flush_rejection_report(state)
     interval = max(5, int(config.get("poll_interval_minutes", 60)))
     due = []
     for feed in feeds:
@@ -421,7 +439,7 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
         state["last_check_result"] = "not_due"
         state["last_check_feed_count"] = 0
         state["last_check_error_count"] = 0
-        state["last_rejection_count"] = 0
+        state["last_rejection_count"] = report_count
         return 0
     results = fetch_many(due)
     new_count = 0
@@ -481,7 +499,9 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
             if item.get("categories"):
                 state["queue"][-1]["categories"] = item["categories"]
             new_count += 1
-    state["last_rejection_count"] = append_rejection_report(rejected_rows)
+    state.setdefault("pending_rejections", []).extend(rejected_rows)
+    report_count += flush_rejection_report(state)
+    state["last_rejection_count"] = report_count
     state["last_check_result"] = "checked"
     state["last_check_feed_count"] = len(due)
     state["last_check_error_count"] = sum(1 for _, _, error in results if error)
@@ -968,7 +988,10 @@ def main() -> int:
             raise RuntimeError("No baseline exists yet. Run setup_baseline.bat first.")
         added = poll_feeds(state, feeds, config)
         rejected = int(state.get("last_rejection_count", 0))
-        if rejected:
+        report_error = state.get("last_rejection_error")
+        if report_error:
+            print(f"WARNING: rejected-article report could not be updated; close rejected_articles.csv if it is open. {report_error}")
+        elif rejected:
             print(f"Logged {rejected} newly rejected article(s) to rejected_articles.csv.")
         if added:
             print(f"Queued {added} new article(s).")
