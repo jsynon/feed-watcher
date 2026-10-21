@@ -8,6 +8,7 @@ config.json
 .venv/
 state.json
 watcher.log
+rejected_articles.csv
 
 # Python cache files
 __pycache__/

@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import datetime as dt
 import io
 import tempfile
@@ -161,13 +162,62 @@ class WatcherTests(unittest.TestCase):
             {"title": "Yesterday's essay", "url": yesterday_url, "published_at": yesterday.isoformat(), "key": watcher.article_key(yesterday_url)},
         ]
         state = {"baseline_at": (now - dt.timedelta(days=30)).isoformat(), "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {}}
-        with patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
-            count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60, "max_age_days_for_new_items": 30})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = Path(temp_dir) / "rejected_articles.csv"
+            with patch.object(watcher, "REJECTIONS_PATH", report), patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
+                count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60, "max_age_days_for_new_items": 30})
         self.assertEqual(count, 1)
         self.assertEqual([row["url"] for row in state["queue"]], [fresh_url])
         self.assertIn(watcher.article_key(old_url), state["seen"])
         self.assertIn(watcher.article_key(undated_url), state["seen"])
         self.assertIn(watcher.article_key(yesterday_url), state["seen"])
+
+
+    def test_poll_records_rejected_article_details_and_deduplicates_report(self):
+        local_now = dt.datetime.now().astimezone()
+        now = dt.datetime.combine(local_now.date(), dt.time(12, 0), tzinfo=local_now.tzinfo).astimezone(dt.timezone.utc)
+        feed = {"title": "Test philosophy feed", "url": "https://example.com/feed"}
+        unrelated_url = "https://example.com/unrelated"
+        yesterday_url = "https://example.com/yesterday"
+        yesterday = dt.datetime.combine(
+            local_now.date() - dt.timedelta(days=1), dt.time(12, 0), tzinfo=local_now.tzinfo
+        ).astimezone(dt.timezone.utc)
+        items = [
+            {
+                "title": "A new guide to summer gadgets", "summary": "A product roundup.",
+                "author": "A. Writer", "url": unrelated_url,
+                "published_at": (now - dt.timedelta(minutes=5)).isoformat(),
+                "key": watcher.article_key(unrelated_url),
+            },
+            {
+                "title": "A new essay on Kant", "url": yesterday_url,
+                "published_at": yesterday.isoformat(),
+                "key": watcher.article_key(yesterday_url),
+            },
+        ]
+        state = {
+            "baseline_at": (now - dt.timedelta(days=30)).isoformat(),
+            "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = Path(temp_dir) / "rejected_articles.csv"
+            with patch.object(watcher, "REJECTIONS_PATH", report), patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
+                watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60})
+                watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60}, force=True)
+            with report.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 2)
+        unrelated = next(row for row in rows if row["url"] == unrelated_url)
+        self.assertEqual(unrelated["source"], feed["title"])
+        self.assertEqual(unrelated["title"], "A new guide to summer gadgets")
+        self.assertEqual(unrelated["author"], "A. Writer")
+        self.assertIn("Subject-relevance filter", unrelated["rejection_reason"])
+        older = next(row for row in rows if row["url"] == yesterday_url)
+        self.assertIn("Publication-date filter", older["rejection_reason"])
+        self.assertIn("Kant", older["matched_topics"])
+        self.assertEqual(state["seen"][watcher.article_key(yesterday_url)]["skip_reason"].split(":")[0],
+                         "Publication-date filter")
 
     def test_publish_disabled_never_calls_buffer(self):
         item = {"title": "A philosophy test article", "url": "https://example.com/test", "source": "Test",
