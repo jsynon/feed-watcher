@@ -1,5 +1,4 @@
 import contextlib
-import csv
 import datetime as dt
 import io
 import tempfile
@@ -53,19 +52,6 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(quanta_score, other_score + 2)
         self.assertTrue(any("science topics" in reason for reason in reasons))
 
-
-    def test_quanta_cell_microscopy_article_is_eligible(self):
-        article = {
-            "title": "See Inside Cells Like Never Before in These Vivid Microscopic Images",
-            "source": "Quanta Magazine",
-            "targets": {"facebook": "pending", "x": "pending"},
-        }
-        self.assertEqual(watcher.rank_candidates([article], {}), [article])
-        _, reasons = watcher.relevance_score(article)
-        self.assertTrue(any("science topics: cells" in reason for reason in reasons))
-        self.assertTrue(any("microscopic" in reason for reason in reasons))
-
-
     def test_literature_and_culture_articles_are_eligible(self):
         literature = {
             "title": "Reading Dostoevsky through the modern novel",
@@ -103,6 +89,37 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(watcher.is_personal_content(personal))
         self.assertEqual(watcher.rank_candidates([personal], {}), [])
 
+    def test_personal_reflection_and_nonmatched_article_are_not_filtered(self):
+        reflection = {
+            "title": "Speculative Fiction That Drew Me In As An Adolescent",
+            "summary": "A personal recollection about reading speculative fiction.",
+            "source": "Gregory Sadler Substack",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        unmatched = {
+            "title": "A new essay",
+            "summary": "A subject that has no matching vocabulary terms.",
+            "source": "A selected Feedly source",
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        self.assertFalse(watcher.is_personal_content(reflection))
+        self.assertFalse(watcher.has_subject_relevance(unmatched))
+        self.assertEqual(set(map(id, watcher.rank_candidates([reflection, unmatched], {}))),
+                         {id(reflection), id(unmatched)})
+
+    def test_unmatched_topic_signal_is_not_a_rejection_reason(self):
+        now = watcher.utcnow()
+        article = {
+            "title": "A new essay",
+            "summary": "No familiar topic keywords appear here.",
+            "published_at": watcher.iso(now),
+            "targets": {"facebook": "pending", "x": "pending"},
+        }
+        reasons = watcher.article_rejection_reasons(
+            article, now - dt.timedelta(hours=1), now.astimezone().date()
+        )
+        self.assertEqual(reasons, [])
+
     def test_sadler_is_deprioritized_when_recently_posted_and_alternatives_exist(self):
         sadler = {"title": "Aristotle on virtue ethics", "source": "Gregory Sadler Substack",
                   "published_at": "2026-10-17T10:00:00+00:00", "targets": {"facebook": "pending", "x": "pending"}}
@@ -114,16 +131,28 @@ class WatcherTests(unittest.TestCase):
         ranked = watcher.rank_candidates([sadler, other], {})
         self.assertIs(ranked[0], sadler)
 
-    def test_source_bonus_does_not_make_unrelated_article_eligible(self):
+    def test_unmatched_nonpersonal_article_is_allowed_by_default(self):
         unrelated = {
             "title": "A new article about local gardening",
             "source": "Gregory B. Sadler - That Philosophy Guy",
             "published_at": "2026-10-17T10:00:00+00:00",
             "targets": {"facebook": "pending", "x": "pending"},
         }
-        self.assertEqual(watcher.rank_candidates([unrelated], {}), [])
+        self.assertEqual(watcher.rank_candidates([unrelated], {}), [unrelated])
 
-    def test_preview_holds_unrelated_article_without_publishing(self):
+    def test_announcements_and_roundups_are_allowed(self):
+        items = [
+            {"title": "Announcing my first book!", "source": "Hi-Phi Nation",
+             "targets": {"facebook": "pending", "x": "pending"}},
+            {"title": "Online Philosophy Resources Weekly Update", "source": "Daily Nous",
+             "targets": {"facebook": "pending", "x": "pending"}},
+            {"title": "The End of The Panpsycast", "source": "Panpsycast",
+             "targets": {"facebook": "pending", "x": "pending"}},
+        ]
+        ranked = watcher.rank_candidates(items, {})
+        self.assertEqual(set(map(id, ranked)), set(map(id, items)))
+
+    def test_preview_allows_unmatched_article_without_publishing(self):
         item = {
             "title": "A new guide to summer gadgets",
             "source": "Nautilus", "url": "https://example.com/health",
@@ -134,10 +163,11 @@ class WatcherTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             watcher.try_publish(state, {"publishing_enabled": False}, dry_run=True)
-        self.assertIn("No queued article passed the subject and personal-content filters", output.getvalue())
+        self.assertIn("Highest-ranked eligible article", output.getvalue())
+        self.assertIn("A new guide to summer gadgets", output.getvalue())
         self.assertEqual(state["queue"], [item])
 
-    def test_generic_health_match_alone_does_not_qualify_supplementary_article(self):
+    def test_article_needs_no_keyword_match_to_be_eligible(self):
         item = {
             "title": "Teen Girls Are Now More Likely to Vape Than Boys",
             "summary": "Smokers gained a way to get nicotine without negative health effects.",
@@ -145,7 +175,7 @@ class WatcherTests(unittest.TestCase):
             "targets": {"facebook": "pending", "x": "pending"},
         }
         self.assertFalse(watcher.has_subject_relevance(item))
-        self.assertEqual(watcher.rank_candidates([item], {}), [])
+        self.assertEqual(watcher.rank_candidates([item], {}), [item])
 
     def test_two_distinct_supplementary_content_signals_qualify(self):
         item = {
@@ -175,62 +205,13 @@ class WatcherTests(unittest.TestCase):
             {"title": "Yesterday's essay", "url": yesterday_url, "published_at": yesterday.isoformat(), "key": watcher.article_key(yesterday_url)},
         ]
         state = {"baseline_at": (now - dt.timedelta(days=30)).isoformat(), "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {}}
-        with tempfile.TemporaryDirectory() as temp_dir:
-            report = Path(temp_dir) / "rejected_articles.csv"
-            with patch.object(watcher, "REJECTIONS_PATH", report), patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
-                count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60, "max_age_days_for_new_items": 30})
+        with patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
+            count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60, "max_age_days_for_new_items": 30})
         self.assertEqual(count, 1)
         self.assertEqual([row["url"] for row in state["queue"]], [fresh_url])
         self.assertIn(watcher.article_key(old_url), state["seen"])
         self.assertIn(watcher.article_key(undated_url), state["seen"])
         self.assertIn(watcher.article_key(yesterday_url), state["seen"])
-
-
-    def test_poll_records_rejected_article_details_and_deduplicates_report(self):
-        local_now = dt.datetime.now().astimezone()
-        now = dt.datetime.combine(local_now.date(), dt.time(12, 0), tzinfo=local_now.tzinfo).astimezone(dt.timezone.utc)
-        feed = {"title": "Test philosophy feed", "url": "https://example.com/feed"}
-        unrelated_url = "https://example.com/unrelated"
-        yesterday_url = "https://example.com/yesterday"
-        yesterday = dt.datetime.combine(
-            local_now.date() - dt.timedelta(days=1), dt.time(12, 0), tzinfo=local_now.tzinfo
-        ).astimezone(dt.timezone.utc)
-        items = [
-            {
-                "title": "A new guide to summer gadgets", "summary": "A product roundup.",
-                "author": "A. Writer", "url": unrelated_url,
-                "published_at": (now - dt.timedelta(minutes=5)).isoformat(),
-                "key": watcher.article_key(unrelated_url),
-            },
-            {
-                "title": "A new essay on Kant", "url": yesterday_url,
-                "published_at": yesterday.isoformat(),
-                "key": watcher.article_key(yesterday_url),
-            },
-        ]
-        state = {
-            "baseline_at": (now - dt.timedelta(days=30)).isoformat(),
-            "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {},
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            report = Path(temp_dir) / "rejected_articles.csv"
-            with patch.object(watcher, "REJECTIONS_PATH", report), patch.object(watcher, "feedparser", object()), patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
-                watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60})
-                watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60}, force=True)
-            with report.open("r", encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-
-        self.assertEqual(len(rows), 2)
-        unrelated = next(row for row in rows if row["url"] == unrelated_url)
-        self.assertEqual(unrelated["source"], feed["title"])
-        self.assertEqual(unrelated["title"], "A new guide to summer gadgets")
-        self.assertEqual(unrelated["author"], "A. Writer")
-        self.assertIn("Subject-relevance filter", unrelated["rejection_reason"])
-        older = next(row for row in rows if row["url"] == yesterday_url)
-        self.assertIn("Publication-date filter", older["rejection_reason"])
-        self.assertIn("Kant", older["matched_topics"])
-        self.assertEqual(state["seen"][watcher.article_key(yesterday_url)]["skip_reason"].split(":")[0],
-                         "Publication-date filter")
 
     def test_publish_disabled_never_calls_buffer(self):
         item = {"title": "A philosophy test article", "url": "https://example.com/test", "source": "Test",

@@ -91,10 +91,8 @@ CULTURE_TERMS = (
     "tradition", "traditions", "custom", "customs", "popular imagination",
 )
 PERSONAL_CONTENT_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
-    r"\bpersonal\s+(?:life|update|blog|story)\b",
-    r"\blife\s+(?:update|story|journal|lately)\b",
     r"\b(?:a\s+)?(?:day|week)\s+in\s+my\s+life\b",
-    r"\bmy\s+(?:life|story|family|cat|cats|dog|dogs|pet|pets|weekend|daily routine)\b",
+    r"\bmy\s+(?:cat|cats|dog|dogs|pet|pets|weekend|daily routine)\b",
     r"\b(?:cat|animal|pet)\s+shelter\b",
     r"\b(?:visit(?:ing)?|volunteer(?:ing)?)\s+(?:at|to)\s+(?:the\s+)?(?:local\s+)?(?:cat|animal|pet)\s+shelter\b",
     r"\bvolunteer(?:ing)?\s+at\s+(?:the\s+)?shelter\b",
@@ -340,9 +338,7 @@ def article_rejection_reasons(item: dict, baseline: dt.datetime, today: dt.date)
     elif published.astimezone().date() != today:
         reasons.append("Publication-date filter: article was not published today (local date)")
     if is_personal_content(item):
-        reasons.append("Personal-content filter: article fields match a personal-life pattern")
-    if not has_subject_relevance(item):
-        reasons.append("Subject-relevance filter: no qualifying topic match in the title or summary")
+        reasons.append("Personal-activity filter: article appears to be an unrelated everyday update")
     return reasons
 
 
@@ -447,6 +443,11 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
     new_count = 0
     rejected_rows = []
     today = now.astimezone().date()
+    diagnostic_counts = {
+        "new": 0, "queued": 0, "date_skipped": 0,
+        "personal_match": 0, "topic_signal_missing": 0, "eligible": 0,
+    }
+    recent_sources = list(state.get("recent_posted_sources", []))[-3:]
     for feed, items, error in results:
         url = feed["url"]
         state["last_checked"][url] = iso(now)
@@ -459,7 +460,43 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
             if key in state.setdefault("seen", {}):
                 continue
             article = {**item, "source": feed["title"]}
+            diagnostic_counts["new"] += 1
+            published = parse_datetime(item.get("published_at"))
+            date_eligible = bool(
+                published and published > baseline and published.astimezone().date() == today
+            )
+            personal_match = is_personal_content(article)
+            topic_signal = has_subject_relevance(article)
+            if personal_match:
+                diagnostic_counts["personal_match"] += 1
+            if not topic_signal:
+                diagnostic_counts["topic_signal_missing"] += 1
+            if not date_eligible:
+                diagnostic_counts["date_skipped"] += 1
+            else:
+                diagnostic_counts["queued"] += 1
+                if not personal_match:
+                    diagnostic_counts["eligible"] += 1
             reasons = article_rejection_reasons(article, baseline, today)
+            score, score_reasons = relevance_score(article, recent_sources)
+            matched_topics = rejection_topic_matches(article) or "none"
+            gate_status = (
+                f"publication={'pass' if date_eligible else 'skip'}; "
+                f"personal={'match' if personal_match else 'clear'}; "
+                f"topic_signal={'match' if topic_signal else 'none'} (ranking only)"
+            )
+            if not date_eligible:
+                disposition = "not-queued: outside same-day publication window"
+            elif personal_match:
+                disposition = "queued, held by personal-activity filter"
+            else:
+                disposition = "queued and eligible for ranking"
+            print(
+                f"Article diagnostic: {feed['title']} | {item['title']} | {disposition}; "
+                f"signals=({gate_status}); rank_score={score:+d}; "
+                f"matched_topics=({matched_topics}); scoring_reasons=({' ; '.join(score_reasons)}); "
+                f"rejection_reasons=({' ; '.join(reasons) if reasons else 'none'}); {item['url']}"
+            )
             if reasons:
                 rejected_rows.append({
                     "key": key,
@@ -469,10 +506,9 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
                     "author": item.get("author", ""),
                     "published_at": item.get("published_at") or "",
                     "rejection_reason": "; ".join(reasons),
-                    "matched_topics": rejection_topic_matches(article),
+                    "matched_topics": matched_topics if matched_topics != "none" else "",
                     "url": item["url"],
                 })
-            published = parse_datetime(item.get("published_at"))
             # Only publish an article on its local calendar publication date.
             # Undated, pre-baseline, and prior-day items are marked seen and skipped.
             if (not published or published <= baseline or
@@ -508,6 +544,16 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
     state["last_check_feed_count"] = len(due)
     state["last_check_error_count"] = sum(1 for _, _, error in results if error)
     state["last_polled_at"] = iso(now)
+    print(
+        "Discovery diagnostics: "
+        f"new={diagnostic_counts['new']}; queued={diagnostic_counts['queued']}; "
+        f"eligible_for_ranking={diagnostic_counts['eligible']}; "
+        f"personal_activity_holds={diagnostic_counts['personal_match']}; "
+        f"no_topic_signal={diagnostic_counts['topic_signal_missing']}; "
+        f"skipped_by_publication_window={diagnostic_counts['date_skipped']}. "
+        "Feedly source selection defines subject scope; topic signals only affect ranking. "
+        "Only clear everyday personal-activity posts are held back."
+    )
     # Keep queue storage stable; selection is performed by the relevance ranker.
     state["queue"].sort(key=lambda x: (x.get("published_at") or "", x.get("queued_at") or "", x.get("title", "").casefold()))
     return new_count
@@ -688,13 +734,7 @@ def relevance_matches(item: dict) -> tuple[list[str], list[str], list[str], list
 
 
 def has_subject_relevance(item: dict) -> bool:
-    """Require stronger article-text evidence for supplementary subjects.
-
-    A philosophy topic or named thinker can qualify on one content match.
-    Science, literature, and culture need a matching title or two distinct
-    content terms. Feed categories can affect ranking but cannot qualify an
-    article by themselves.
-    """
+    """Report familiar subject terms for diagnostics; this is not an eligibility gate."""
     content = {
         "title": str(item.get("title") or ""),
         "summary": str(item.get("summary") or ""),
@@ -748,7 +788,7 @@ def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tupl
 
 
 def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
-    """Rank relevant fresh candidates; finish any started cross-post first."""
+    """Rank fresh candidates; finish any started cross-post first."""
     pending = [item for item in queue if any(
         value in {"pending", "retry"} for value in item.get("targets", {}).values()
     )]
@@ -761,10 +801,10 @@ def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
             item["_ranking_reasons"] = ["complete an article already accepted by one channel"]
         return partial
 
-    # Source bonuses can reorder relevant items, but cannot make an unrelated
-    # article eligible by themselves. Low-match items remain queued until midnight.
-    pending = [item for item in pending
-               if not is_personal_content(item) and has_subject_relevance(item)]
+    # The user's selected Feedly folder is the scope boundary. Allow articles
+    # by default; subject signals rank candidates, while clear everyday
+    # personal-activity posts are held back.
+    pending = [item for item in pending if not is_personal_content(item)]
     recent = list(state.get("recent_posted_sources", []))[-3:]
     sadler_count = recent.count("gregory-sadler")
     non_sadler = [item for item in pending if source_group(item) != "gregory-sadler"]
@@ -791,12 +831,34 @@ def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     if expired_count:
         print(f"Discarded {expired_count} queued article(s) not published today.")
     ranked = rank_candidates(queue, state)
+    pending = [entry for entry in queue if any(
+        value in {"pending", "retry"} for value in entry.get("targets", {}).values()
+    )]
+    personal_matches = sum(1 for entry in pending if not any(
+        value == "sent" for value in entry.get("targets", {}).values()
+    ) and is_personal_content(entry))
+    no_topic_signal = sum(1 for entry in pending if not any(
+        value == "sent" for value in entry.get("targets", {}).values()
+    ) and not has_subject_relevance(entry))
+    print(
+        "Selection diagnostics: "
+        f"pending={len(pending)}; ranked={len(ranked)}; "
+        f"personal_activity_holds={personal_matches}; no_topic_signal={no_topic_signal} (ranking only)."
+    )
+    for rank, candidate in enumerate(ranked[:3], 1):
+        score = candidate.get("_ranking_score", 0)
+        why = "; ".join(candidate.get("_ranking_reasons", [])) or "finish an already accepted cross-post"
+        print(
+            f"Relevance candidate #{rank}: score {score:+d}; "
+            f"{candidate.get('source', 'Unknown source')} | {candidate.get('title', '')}; "
+            f"why={why}"
+        )
     if not ranked:
         pending = [entry for entry in queue if any(
             value in {"pending", "retry"} for value in entry.get("targets", {}).values()
         )]
         if pending:
-            print(f"No queued article passed the subject and personal-content filters; {len(pending)} item(s) held until midnight expiry.")
+            print(f"No queued article passed the personal-activity filter; {len(pending)} item(s) held until midnight expiry.")
         else:
             print("Queue is empty; nothing to preview." if dry_run else "Queue is empty; nothing to publish.")
         return False
