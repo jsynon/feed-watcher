@@ -129,25 +129,27 @@ class WatcherTests(unittest.TestCase):
     def test_twelve_hour_freshness_window_catches_late_night_articles(self):
         now = dt.datetime(2026, 10, 22, 7, 59, tzinfo=dt.timezone.utc)
         baseline = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
-        sadler_video = {"published_at": "2026-10-22T01:39:22+00:00"}
+        sadler_video = {
+            "published_at": "2026-10-22T01:39:22+00:00",
+            "discovered_at": "2026-10-22T01:39:22+00:00",
+        }
         fresh, reason = watcher.article_is_fresh(sadler_video, baseline, now)
         self.assertTrue(fresh)
         self.assertIsNone(reason)
-        old_article = {"published_at": "2026-10-21T19:58:00+00:00"}
+        misleading_future_date = {
+            "published_at": "2026-10-23T04:55:04+00:00",
+            "discovered_at": "2026-10-22T20:59:01+00:00",
+        }
+        report_now = dt.datetime(2026, 10, 22, 21, 0, tzinfo=dt.timezone.utc)
+        fresh, reason = watcher.article_is_fresh(misleading_future_date, baseline, report_now)
+        self.assertTrue(fresh)
+        old_article = {"discovered_at": "2026-10-21T19:58:00+00:00"}
         fresh, reason = watcher.article_is_fresh(old_article, baseline, now)
         self.assertFalse(fresh)
         self.assertIn("12-hour", reason)
 
-    def test_linked_article_date_parser_reads_meta_and_jsonld(self):
-        parser = watcher._PublicationDateParser()
-        parser.feed('''<meta property="article:published_time" content="2026-10-22T01:39:22Z">
-            <script type="application/ld+json">{"@type":"Article","datePublished":"2026-10-22T01:39:22Z"}</script>''')
-        self.assertEqual(parser.dates[0], "2026-10-22T01:39:22Z")
-        self.assertIn("2026-10-22T01:39:22Z", list(parser.jsonld_dates()))
-
-    def test_arts_and_letters_undated_feed_entry_uses_linked_article_date(self):
+    def test_arts_and_letters_undated_entry_is_eligible_when_newly_discovered(self):
         now = dt.datetime(2026, 10, 22, 7, 59, tzinfo=dt.timezone.utc)
-        published = "2026-10-22T01:39:22+00:00"
         feed = {"title": "Arts & Letters Daily", "url": "https://example.com/feed"}
         url = "https://example.com/essay"
         item = {"title": "An essay on moral philosophy", "url": url, "published_at": None,
@@ -156,12 +158,12 @@ class WatcherTests(unittest.TestCase):
                  "seen": {}, "queue": [], "feed_errors": {}}
         with patch.object(watcher, "feedparser", object()), \
              patch.object(watcher, "utcnow", return_value=now), \
-             patch.object(watcher, "fetch_many", return_value=[(feed, [item], None)]), \
-             patch.object(watcher, "fetch_linked_publication_date", return_value=published):
+             patch.object(watcher, "fetch_many", return_value=[(feed, [item], None)]):
             count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60})
         self.assertEqual(count, 1)
-        self.assertEqual(state["queue"][0]["published_at"], published)
-        self.assertEqual(state["queue"][0]["publication_date_source"], "linked article page metadata")
+        self.assertIsNone(state["queue"][0]["published_at"])
+        self.assertEqual(state["queue"][0]["source"], "Arts & Letters Daily")
+        self.assertEqual(state["queue"][0]["discovered_at"], now.isoformat())
 
     def test_sadler_is_deprioritized_when_recently_posted_and_alternatives_exist(self):
         sadler = {"title": "Aristotle on virtue ethics", "source": "Gregory Sadler Substack",
@@ -230,7 +232,7 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(watcher.has_subject_relevance(item))
         self.assertEqual(watcher.rank_candidates([item], {}), [item])
 
-    def test_poll_queues_only_dated_items_newer_than_baseline(self):
+    def test_poll_uses_discovery_time_when_feed_publication_dates_are_missing_or_misleading(self):
         local_now = dt.datetime.now().astimezone()
         now = dt.datetime.combine(local_now.date(), dt.time(12, 0), tzinfo=local_now.tzinfo).astimezone(dt.timezone.utc)
         feed = {"title": "Test philosophy feed", "url": "https://example.com/feed"}
@@ -238,24 +240,45 @@ class WatcherTests(unittest.TestCase):
         old_url = "https://example.com/old"
         undated_url = "https://example.com/undated"
         yesterday_url = "https://example.com/yesterday"
+        future_url = "https://plato.stanford.edu/entries/kant-transcendental/"
         yesterday = now - dt.timedelta(hours=6)
         items = [
             {"title": "New essay", "url": fresh_url, "published_at": (now - dt.timedelta(minutes=5)).isoformat(), "key": watcher.article_key(fresh_url)},
             {"title": "Old essay", "url": old_url, "published_at": (now - dt.timedelta(days=2)).isoformat(), "key": watcher.article_key(old_url)},
             {"title": "No timestamp", "url": undated_url, "published_at": None, "key": watcher.article_key(undated_url)},
             {"title": "Yesterday's essay", "url": yesterday_url, "published_at": yesterday.isoformat(), "key": watcher.article_key(yesterday_url)},
+            {"title": "Kant's Transcendental Arguments", "url": future_url, "published_at": "2026-10-23T04:55:04+00:00", "key": watcher.article_key(future_url)},
         ]
         state = {"baseline_at": (now - dt.timedelta(days=30)).isoformat(), "last_checked": {}, "seen": {}, "queue": [], "feed_errors": {}}
         with patch.object(watcher, "feedparser", object()), \
              patch.object(watcher, "utcnow", return_value=now), \
              patch.object(watcher, "fetch_many", return_value=[(feed, items, None)]):
             count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60, "max_age_days_for_new_items": 30})
-        self.assertEqual(count, 2)
-        self.assertEqual({row["url"] for row in state["queue"]}, {fresh_url, yesterday_url})
-        self.assertIn(watcher.article_key(old_url), state["seen"])
-        self.assertIn(watcher.article_key(undated_url), state["seen"])
-        self.assertIn(watcher.article_key(yesterday_url), state["seen"])
-        self.assertIn(yesterday_url, [row["url"] for row in state["queue"]])
+        expected = {fresh_url, old_url, undated_url, yesterday_url, future_url}
+        self.assertEqual(count, len(expected))
+        self.assertEqual({row["url"] for row in state["queue"]}, expected)
+        self.assertTrue(all(row["discovered_at"] == now.isoformat() for row in state["queue"]))
+
+    def test_recently_date_skipped_item_is_reconsidered_under_discovery_rule(self):
+        now = dt.datetime(2026, 10, 22, 7, 59, tzinfo=dt.timezone.utc)
+        baseline = "2026-10-01T00:00:00+00:00"
+        feed = {"title": "Arts & Letters Daily", "url": "https://example.com/feed"}
+        url = "https://example.com/recently-skipped"
+        key = watcher.article_key(url)
+        item = {"title": "A newly surfaced essay", "url": url, "published_at": None, "key": key}
+        state = {
+            "baseline_at": baseline, "last_checked": {}, "queue": [], "feed_errors": {},
+            "seen": {key: {"url": url, "seen_at": (now - dt.timedelta(hours=1)).isoformat(),
+                           "skipped": True,
+                           "skip_reason": "Publication-date filter: feed item has no valid publication date"}},
+        }
+        with patch.object(watcher, "feedparser", object()), \
+             patch.object(watcher, "utcnow", return_value=now), \
+             patch.object(watcher, "fetch_many", return_value=[(feed, [item], None)]):
+            count = watcher.poll_feeds(state, [feed], {"poll_interval_minutes": 60})
+        self.assertEqual(count, 1)
+        self.assertEqual(len(state["queue"]), 1)
+        self.assertEqual(state["queue"][0]["discovered_at"], (now - dt.timedelta(hours=1)).isoformat())
 
     def test_publish_disabled_never_calls_buffer(self):
         item = {"title": "A philosophy test article", "url": "https://example.com/test", "source": "Test",
