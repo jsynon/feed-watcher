@@ -110,6 +110,8 @@ PHILOSOPHERS = (
 )
 SADLER_SOURCE_RE = re.compile(r"gregory\s*(?:b\.?\s*)?sadler|that philosophy guy", re.I)
 QUANTA_SOURCE_RE = re.compile(r"quanta(?:\s+magazine)?", re.I)
+ARTS_LETTERS_SOURCE_RE = re.compile(r"arts\s*(?:&|and)\s*letters\s*daily", re.I)
+MAX_ARTICLE_AGE_HOURS = 12
 
 
 def utcnow() -> dt.datetime:
@@ -322,24 +324,108 @@ def do_baseline() -> int:
 
 
 REJECTION_FIELDS = (
-    "discovered_at", "source", "title", "author", "published_at",
+    "discovered_at", "source", "title", "author", "published_at", "publication_date_source",
     "rejection_reason", "matched_topics", "url",
 )
 
 
-def article_rejection_reasons(item: dict, baseline: dt.datetime, today: dt.date) -> list[str]:
-    """Explain why a newly discovered article is ineligible for today's queue."""
-    reasons = []
+def article_is_fresh(item: dict, baseline: dt.datetime, now: dt.datetime) -> tuple[bool, str | None]:
+    """Allow recent articles for up to 12 hours, including late-night posts found after midnight."""
     published = parse_datetime(item.get("published_at"))
+    baseline = parse_datetime(baseline.isoformat()) if baseline.tzinfo else baseline.replace(tzinfo=dt.timezone.utc)
+    now = parse_datetime(now.isoformat()) if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
     if not published:
-        reasons.append("Publication-date filter: feed item has no valid publication date")
-    elif published <= baseline:
-        reasons.append("Publication-date filter: article predates the watcher baseline")
-    elif published.astimezone().date() != today:
-        reasons.append("Publication-date filter: article was not published today (local date)")
+        return False, "Publication-date filter: feed and linked page have no valid publication date"
+    if published <= baseline:
+        return False, "Publication-date filter: article predates the watcher baseline"
+    age = now - published
+    if age.total_seconds() < 0:
+        return False, "Publication-date filter: article publication time is in the future"
+    if age > dt.timedelta(hours=MAX_ARTICLE_AGE_HOURS):
+        return False, f"Publication-date filter: article is older than the {MAX_ARTICLE_AGE_HOURS}-hour freshness window"
+    return True, None
+
+
+def article_rejection_reasons(item: dict, baseline: dt.datetime, now: dt.datetime) -> list[str]:
+    """Explain why a newly discovered article is ineligible for the freshness window."""
+    reasons = []
+    fresh, date_reason = article_is_fresh(item, baseline, now)
+    if not fresh and date_reason:
+        reasons.append(date_reason)
     if is_personal_content(item):
         reasons.append("Personal-activity filter: article appears to be an unrelated everyday update")
     return reasons
+
+
+class _PublicationDateParser(HTMLParser):
+    """Collect publication dates from common article metadata and JSON-LD."""
+    DATE_KEYS = {"article:published_time", "datepublished", "parsely-pub-date", "pubdate", "publishdate"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.dates = []
+        self._jsonld = []
+        self._in_jsonld = False
+
+    def handle_starttag(self, tag, attrs):
+        data = {str(k).casefold(): str(v).strip() for k, v in attrs if k and v}
+        if tag.casefold() == "meta":
+            key = (data.get("property") or data.get("name") or data.get("itemprop") or "").casefold()
+            value = data.get("content") or data.get("value")
+            if key in self.DATE_KEYS and value:
+                self.dates.append(value)
+        elif tag.casefold() == "time" and "datepublished" in data.get("itemprop", "").casefold():
+            value = data.get("datetime") or data.get("content")
+            if value:
+                self.dates.append(value)
+        elif tag.casefold() == "script" and "ld+json" in data.get("type", "").casefold():
+            self._in_jsonld = True
+
+    def handle_endtag(self, tag):
+        if tag.casefold() == "script":
+            self._in_jsonld = False
+
+    def handle_data(self, data):
+        if self._in_jsonld:
+            self._jsonld.append(data)
+
+    def jsonld_dates(self):
+        def walk(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key.casefold() == "datepublished" and isinstance(child, str):
+                        yield child
+                    yield from walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from walk(child)
+        for blob in self._jsonld:
+            try:
+                yield from walk(json.loads(blob))
+            except (ValueError, TypeError):
+                continue
+
+
+def fetch_linked_publication_date(url: str) -> str | None:
+    """Read an original publication timestamp from common article-page metadata."""
+    try:
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; AntilogicalismFeedWatcher/1.0)",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+        })
+        with urllib.request.urlopen(request, timeout=12) as response:
+            raw = response.read(1024 * 1024)
+            charset = response.headers.get_content_charset() or "utf-8"
+        parser = _PublicationDateParser()
+        parser.feed(raw.decode(charset, errors="replace"))
+        for candidate in [*parser.dates, *parser.jsonld_dates()]:
+            parsed = parse_datetime(candidate)
+            if parsed:
+                return parsed.isoformat(timespec="seconds")
+    except Exception:
+        # Page metadata may be blocked; leave the item undated and report it for review.
+        return None
+    return None
 
 
 def rejection_topic_matches(item: dict) -> str:
@@ -442,7 +528,6 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
     results = fetch_many(due)
     new_count = 0
     rejected_rows = []
-    today = now.astimezone().date()
     diagnostic_counts = {
         "new": 0, "queued": 0, "date_skipped": 0,
         "personal_match": 0, "topic_signal_missing": 0, "eligible": 0,
@@ -461,10 +546,14 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
                 continue
             article = {**item, "source": feed["title"]}
             diagnostic_counts["new"] += 1
-            published = parse_datetime(item.get("published_at"))
-            date_eligible = bool(
-                published and published > baseline and published.astimezone().date() == today
-            )
+            article.setdefault("publication_date_source", "feed")
+            if (not article.get("published_at") and
+                    ARTS_LETTERS_SOURCE_RE.search(feed.get("title", ""))):
+                linked_date = fetch_linked_publication_date(article["url"])
+                if linked_date:
+                    article["published_at"] = linked_date
+                    article["publication_date_source"] = "linked article page metadata"
+            date_eligible, date_reason = article_is_fresh(article, baseline, now)
             personal_match = is_personal_content(article)
             topic_signal = has_subject_relevance(article)
             if personal_match:
@@ -477,16 +566,17 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
                 diagnostic_counts["queued"] += 1
                 if not personal_match:
                     diagnostic_counts["eligible"] += 1
-            reasons = article_rejection_reasons(article, baseline, today)
+            reasons = article_rejection_reasons(article, baseline, now)
             score, score_reasons = relevance_score(article, recent_sources)
             matched_topics = rejection_topic_matches(article) or "none"
             gate_status = (
-                f"publication={'pass' if date_eligible else 'skip'}; "
+                f"publication={'pass' if date_eligible else 'skip'}"
+                f" ({article.get('publication_date_source', 'feed')}); "
                 f"personal={'match' if personal_match else 'clear'}; "
                 f"topic_signal={'match' if topic_signal else 'none'} (ranking only)"
             )
             if not date_eligible:
-                disposition = "not-queued: outside same-day publication window"
+                disposition = "not-queued: outside 12-hour publication window"
             elif personal_match:
                 disposition = "queued, held by personal-activity filter"
             else:
@@ -504,32 +594,30 @@ def poll_feeds(state: dict, feeds: list[dict], config: dict, force: bool = False
                     "source": feed["title"],
                     "title": item["title"],
                     "author": item.get("author", ""),
-                    "published_at": item.get("published_at") or "",
+                    "published_at": article.get("published_at") or "",
+                    "publication_date_source": article.get("publication_date_source", "feed"),
                     "rejection_reason": "; ".join(reasons),
                     "matched_topics": matched_topics if matched_topics != "none" else "",
                     "url": item["url"],
                 })
-            # Only publish an article on its local calendar publication date.
-            # Undated, pre-baseline, and prior-day items are marked seen and skipped.
-            if (not published or published <= baseline or
-                    published.astimezone().date() != today):
-                date_reason = next(
-                    (reason for reason in reasons if reason.startswith("Publication-date filter:")),
-                    "Publication-date filter: outside the eligible publication window",
-                )
+            # Keep only fresh articles. The 12-hour window catches late-night
+            # stories that the hourly watcher first sees after local midnight.
+            if not date_eligible:
                 state["seen"][key] = {
                     "url": item["url"], "seen_at": iso(now), "skipped": True,
                     "title": item["title"], "source": feed["title"],
-                    "published_at": item.get("published_at"), "skip_reason": date_reason,
+                    "published_at": article.get("published_at"), "skip_reason": date_reason,
                 }
                 continue
             state["seen"][key] = {"url": item["url"], "seen_at": iso(now)}
             state.setdefault("queue", []).append({
                 "key": key, "title": item["title"], "url": item["url"],
-                "source": feed["title"], "published_at": item["published_at"],
+                "source": feed["title"], "published_at": article["published_at"],
                 "queued_at": iso(now), "targets": {"facebook": "pending", "x": "pending"},
                 "attempts": {"facebook": 0, "x": 0}, "errors": {}
             })
+            if article.get("publication_date_source") != "feed":
+                state["queue"][-1]["publication_date_source"] = article["publication_date_source"]
             if item.get("author"):
                 state["queue"][-1]["author"] = item["author"]
             if item.get("summary"):
@@ -700,6 +788,8 @@ def source_group(item: dict) -> str:
         return "gregory-sadler"
     if QUANTA_SOURCE_RE.search(str(item.get("source") or "")):
         return "quanta-magazine"
+    if ARTS_LETTERS_SOURCE_RE.search(str(item.get("source") or "")):
+        return "arts-letters-daily"
     return re.sub(r"\s+", " ", str(item.get("source") or "Unknown source")).strip().casefold()
 
 
@@ -774,8 +864,11 @@ def relevance_score(item: dict, recent_sources: list[str] | None = None) -> tupl
         reasons.append("culture topics: " + ", ".join(culture_hits[:5]))
     group = source_group(item)
     if group == "gregory-sadler":
-        score += 2
-        reasons.append("Gregory Sadler source (+2)")
+        score += 3
+        reasons.append("Gregory Sadler source (+3)")
+    if group == "arts-letters-daily":
+        score += 3
+        reasons.append("Arts & Letters Daily curated source (+3)")
     if group == "quanta-magazine":
         score += 2
         reasons.append("Quanta Magazine source (+2)")
@@ -823,13 +916,13 @@ def rank_candidates(queue: list[dict], state: dict) -> list[dict]:
 
 def try_publish(state: dict, config: dict, dry_run: bool = False) -> bool:
     queue = state.get("queue", [])
-    today = dt.datetime.now().astimezone().date()
+    now = utcnow()
     original_count = len(queue)
-    queue[:] = [entry for entry in queue
-                if local_publication_date(entry.get("published_at")) == today]
+    baseline = parse_datetime(state.get("baseline_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    queue[:] = [entry for entry in queue if article_is_fresh(entry, baseline, now)[0]]
     expired_count = original_count - len(queue)
     if expired_count:
-        print(f"Discarded {expired_count} queued article(s) not published today.")
+        print(f"Discarded {expired_count} queued article(s) outside the {MAX_ARTICLE_AGE_HOURS}-hour freshness window.")
     ranked = rank_candidates(queue, state)
     pending = [entry for entry in queue if any(
         value in {"pending", "retry"} for value in entry.get("targets", {}).values()
